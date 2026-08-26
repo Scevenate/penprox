@@ -1,0 +1,19 @@
+[project]
+name = "penprox"
+version = "0.1.0"
+description = "Proxy toolbox specialized for firewall penetration"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Unlicense"
+dependencies = [
+    "culsans>=0.11.0",
+]
+
+[build-system]
+requires = [
+   "build",
+   "setuptools>=80",
+   "setuptools-rust>=1.13.0",
+   "setuptools-golang>=2.9.0"
+]
+build-backend = "setuptools.build_meta"
