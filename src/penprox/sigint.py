@@ -3,9 +3,10 @@ A drop-in import that broadcasts signals to all running graphs when
 received system SIGINT.
 """
 
-from ._src.framework import _penprox_running_graphs
-import sys
 import signal
+import sys
+
+from ._src.sdk import _penprox_running_graphs
 
 _penprox_sigints = 0
 
@@ -26,7 +27,7 @@ def sigint_handler(signum, frame):
             _penprox_sigints += 1
         case 2:
             print("[SIGINT=2] exit(1)", file=sys.stderr)
-            exit(1)
+            sys.exit(1)
 
 signal.signal(signal.SIGINT, sigint_handler)
 

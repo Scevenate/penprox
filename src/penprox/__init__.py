@@ -4,30 +4,31 @@ Proxy toolbox specialized in firewall penetration.
 [Github repository](https://github.com/Scevenate/penprox)
 """
 
-from ._src.framework import (
-    ProxyTCPAddress,
-    ProxyUDPAddress,
-    ProxyAddress,
-    ProxyTCPConnection,
-    ProxyUDPConnection,
-    ProxyConnection,
-    ProxyRequest,
-    ProxyPacket,
-    ProxyMessage,
-    ProxyBidict,
-    ProxySignal,
-    ProxyEdge,
-    ProxyEdgeEnd,
-    ProxyGraph,
-    ProxyNode,
-)
+# ruff: noqa: F401
 
-from ._src.nodes import (
-    UpstreamTCPNode,
-    UpstreamUDPNode,
+from ._src.common import (
+    DemuxTCPUDPNode,
     DownstreamTCPNode,
     DownstreamUDPNode,
     ExitServerNode,
     MuxTCPUDPNode,
-    DemuxTCPUDPNode,
+    UpstreamTCPNode,
+    UpstreamUDPNode,
+)
+from ._src.sdk import (
+    ProxyBidict,
+    ProxyEdge,
+    ProxyEdgeEnd,
+    ProxyGraph,
+    ProxyNode,
+    ProxySignal,
+    ProxyTCPConnection,
+    ProxyTCPMessage,
+    ProxyTCPPacket,
+    ProxyTCPSession,
+    ProxyUDPConnection,
+    ProxyUDPMessage,
+    ProxyUDPPacket,
+    ProxyUDPSession,
+    queryDNS,
 )

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Unlicense"
 dependencies = [
+    "aiodns>=4.0.4",
     "culsans>=0.11.0",
 ]
 
@@ -17,3 +18,8 @@ requires = [
    "setuptools-golang>=2.9.0"
 ]
 build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.5",
+]

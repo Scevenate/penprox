@@ -1,14 +1,21 @@
+"""
+penprox SDK single source of truth. Also exported as penprox library API.
+"""
+
 from __future__ import annotations
+
+import asyncio
 from abc import ABC, abstractmethod
+from asyncio import Queue, create_task
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address
-from asyncio import Queue, create_task
-import asyncio
-from culsans import Queue as HybridQueue
-from typing import Optional, Literal
-from logging import getLogger
 from itertools import chain
+from logging import getLogger
 from threading import Lock
+from typing import Literal
+
+import aiodns
+from culsans import Queue as HybridQueue
 
 logger = getLogger(__name__)
 
@@ -34,97 +41,93 @@ class _RunningGraphs:
 
 _penprox_running_graphs: _RunningGraphs = _RunningGraphs()
 
-ProxyTCPAddress = tuple[
-    IPv4Address | IPv6Address,
-    Literal["TCP"],
-    int
-]
+_dnsResolver = aiodns.DNSResolver()
 
-ProxyUDPAddress = tuple[
-    IPv4Address | IPv6Address,
-    Literal["UDP"],
-    int
-]
+async def queryDNS(domain: str) -> IPv4Address | IPv6Address | None:
+    result = await _dnsResolver.query_dns(domain, "A")
+    if result.answer: 
+        return IPv4Address(result.answer[0].data.addr) # type: ignore
+    result = await _dnsResolver.query_dns(domain, "AAAA")
+    if result.answer:
+        return IPv6Address(result.answer[0].data.addr) # type: ignore
 
-ProxyAddress = ProxyTCPAddress | ProxyUDPAddress
-
-@dataclass(eq=False, slots=True)
+@dataclass(eq=False, slots=True, frozen=True)
 class ProxyTCPConnection:
     """
-    A conceptual TCP connection. Mostly being identity compared as
-    `ProxyConnection`.
-
-    Transport is `None` Only when being passed in a downstream SYN packet,
-    which is populated by downstream network endpoint node. Otherwise the
-    object is immutable.
+    A conceptual TCP connection.
     """
-    transport: Optional[asyncio.Transport]
-    remoteAddress: ProxyTCPAddress
-
-@dataclass(eq=False, slots=True)
-class ProxyUDPConnection:
-    """
-    A conceptual UDP connection. Mostly being identity compared as
-    `ProxyConnection`.
-    
-    All UDP traffic using one endpoint share the same
-    transport, and local nodes are always responsible for closing the
-    connection.
-
-    Transport is `None` Only when being passed in a downstream SYN packet,
-    which is populated by downstream network endpoint node. Otherwise the
-    object is immutable.
-    """
-    transport: Optional[asyncio.DatagramTransport]
-    remoteAddress: ProxyUDPAddress
-
-ProxyConnection = ProxyTCPConnection | ProxyUDPConnection
-
-@dataclass(eq=False, slots=True)
-class ProxyPacket:
-    """
-    A conceptual network packet. Nodes should respect packet atomicity
-    unless otherwise documented.
-
-    Outbound connections are instantiated by the most upstream node,
-    then run downstream by sending it in a SYN notification; Other than
-    this exception, connections can only be used for identity comparison.
-    """
-    connection: ProxyConnection
-    data: bytes
-    flag: Optional[Literal["SYN", "FIN"]]
-
-@dataclass(eq=False, slots=True)
-class ProxyRequest:
-    """
-    A semantic proxy request. Always constructed by upstream proxy server.
-
-    Different from `ProxyConnection`, domain names are allowed, and downstream
-    nodes are allowed to resolve & mutate destination domain in async runtime.
-    Otherwise the object is immutable.
-    """
-    destination: IPv4Address | IPv6Address | str
-    transport: Literal["TCP", "UDP"]
+    host: IPv4Address | IPv6Address
     port: int
 
-@dataclass(eq=False, slots=True)
-class ProxyMessage:
+@dataclass(eq=False, slots=True, frozen=True)
+class ProxyTCPPacket:
     """
-    A conceptual message in `ProxyRequest`. Nodes should respect
-    message atomicity unless otherwise documented.
-
-    `SYN` message always comes from upstream; Downstream may push
-    `FIN` messages back.
+    A conceptual TCP packet in `ProxyTCPConnection`.
     """
-    request: ProxyRequest
+    bound: ProxyTCPConnection
     data: bytes
-    flag: Optional[Literal["SYN", "FIN"]]
+    flag: Literal["SYN", "FIN"] | None
+
+@dataclass(eq=False, slots=True, frozen=True)
+class ProxyUDPConnection:
+    """
+    A conceptual UDP connection.
+    """
+    host: IPv4Address | IPv6Address
+    port: int
+
+@dataclass(eq=False, slots=True, frozen=True)
+class ProxyUDPPacket:
+    """
+    A conceptual UDP packet in `ProxyUDPConnection`.
+    """
+    bound: ProxyUDPConnection
+    data: bytes
+    flag: Literal["SYN", "FIN"] | None
+
+@dataclass(eq=False, slots=True)
+class ProxyTCPSession:
+    """
+    A semantic TCP proxy session.
+
+    Notice that host may be `str` (domain name), which is allowed to be
+    asynchronously resolved & mutated into IP address.
+    """
+    host: IPv4Address | IPv6Address | str
+    port: int
+
+@dataclass(eq=False, slots=True, frozen=True)
+class ProxyTCPMessage:
+    """
+    A conceptual TCP message in `ProxyTCPSession`.
+    """
+    bound: ProxyTCPSession
+    data: bytes
+    flag: Literal["SYN", "FIN"] | None
+
+@dataclass(eq=False, slots=True)
+class ProxyUDPSession:
+    """
+    A semantic UDP proxy session.
+
+    Notice that host may be `str` (domain name), which is allowed to be
+    asynchronously resolved & mutated into IP address.
+    """
+    host: IPv4Address | IPv6Address | str
+    port: int
+
+@dataclass(eq=False, slots=True, frozen=True)
+class ProxyUDPMessage:
+    """
+    A conceptual TCP message in `ProxyUDPSession`.
+    """
+    bound: ProxyUDPSession
+    data: bytes
+    flag: Literal["SYN", "FIN"] | None
 
 class ProxyBidict[X, Y]:
     """
-    1-to-1 relation indexed on both side. Not thread safe.
-
-    Most commonly used for `ProxyConnection` and `ProxyRequest` mapping.
+    1-to-1 storage indexed on both sides.
     """
     __slots__ = (
         "_x",
@@ -145,30 +148,30 @@ class ProxyBidict[X, Y]:
             del self._x[self._y[y]]
         self._x[x] = y
         self._y[y] = x
-    def getx(self, x: X) -> Y:
+    def xgety(self, x: X) -> Y:
         """
         Get relation by `X`.
 
         `KeyError` if not exist.
         """
         return self._x[x]
-    def gety(self, y: Y) -> X:
+    def ygetx(self, y: Y) -> X:
         """
         Get relation by `Y`.
 
         `KeyError` if not exist.
         """
         return self._y[y]
-    def discardx(self, x: X):
+    def xdiscard(self, x: X):
         """
-        Idempotently delete relation by X.
+        Idempotently remove by X.
         """
         y = self._x.pop(x, None)
         if y:
             del self._y[y]
-    def discardy(self, y: Y):
+    def ydiscard(self, y: Y):
         """
-        Idempotently delete relation by Y.
+        Idempotently remove by Y.
         """
         x = self._y.pop(y, None)
         if x:
@@ -179,26 +182,17 @@ class ProxyBidict[X, Y]:
         """
         return not self._x
 
-# A list of unidirectional signals.
-# Caution: implementor must carefully review existing signal handlers
-# if they want to extend this list.
+# Unidirectional control signals.
 ProxySignal = Literal[
-    # Asks a node to stop serving new proxy requests and quit after
-    # serving current ones
-    # Notice that this onlyl gatekeeps upstream network nodes to prevent
-    # data races; Other nodes keeps serving as usual until their states
-    # are fully cleared.
-    "SIGTERM",
     # Asks a node to immediately clear up its resource and return
-    # Effort to maintain a consistent graph is not required
-    # This signal overwrites SIGTERM
-    "SIGKILL" 
+    # Effort to maintain a consistent state is not required
+    "SIGKILL",
+    # For nodes on SIGTERM boundary, stop accepting new connections.
+    # For all nodes, return after all existing connections are closed.
+    "SIGTERM",
 ]
 
-ProxyEdgeEnd = tuple[
-    Queue[ProxyPacket | ProxyMessage], 
-    Queue[ProxyPacket | ProxyMessage]
-]
+ProxyEdgeEnd = tuple[Queue, Queue]
 
 def ProxyEdge() -> tuple[ProxyEdgeEnd, ProxyEdgeEnd]:
     """
@@ -214,13 +208,16 @@ def ProxyEdge() -> tuple[ProxyEdgeEnd, ProxyEdgeEnd]:
 
 class ProxyNode(ABC):
     """
-    ABC for all nodes.
+    ABC for all `ProxyNode`.
 
-    This class declares abstract ProxyNode interface and
-    some common syntactic sugar on top of it.
+    A `ProxyNode` is a async runtime service managed by `ProxyGraph`.
 
-    Implementor should define class __slots__ and _version,
-    then concrete abstract methods.
+    This class declares abstract ProxyNode interface and some syntactic
+    sugar.
+
+    Implementor should at least define class __slots__ and _version,
+    instance _edges, _running, _controller, _boundary in __init__,
+    then define a concrete self.run().
     """
     __slots__ = ()
 
@@ -228,46 +225,100 @@ class ProxyNode(ABC):
     @classmethod
     def version(cls) -> str:
         """
-        Implementor must define a deterministic version string.
-
-        There is no retrictions on formats whatsoever,
-        but following upstream version conventions or
-        semantic versioning is recommended.
+        Get the version of the node. Formats may differ between nodes.
         """
         return cls._version
     @abstractmethod
-    def edges(self) -> list[Optional[ProxyEdgeEnd]]:
+    def edges(self) -> list[ProxyEdgeEnd | None]:
         """
-        Get the node's edges. The plugging order should be documented.
+        Get the node's edges.
 
-        Do not mutate when running.
+        Unless otherwise documented, do not mutate while running.
         """
-        ...
+        return self._edges # type: ignore
     @abstractmethod
     def controller(self) -> Queue[ProxySignal]:
         """
         Get the node's controller end. (mpsc)
         """
-        ...
-    @abstractmethod
+        return self._controller # type: ignore
     def running(self) -> bool:
         """
         Returns `True` iff the node is running.
         """
+        return self._running # type: ignore
     @abstractmethod
-    async def run(self) -> Optional[ProxySignal]:
+    def boundary(self) -> bool:
         """
-        Run the node. Raises `RuntimeError` if the node is already running,
-        raises `ValueError` if the node is misconfigured.
+        Returns `True` iff the node is a SIGTERM boundary node.
+        """
+        return self._boundary # type: ignore
+    @abstractmethod
+    async def run(self) -> ProxySignal | None:
+        """
+        Run the node.
+
+        This is usually managed by a `ProxyGraph`, but advanced users may
+        orchestrate their own solution.
 
         The node may return a signal to be broadcasted. The node may also
-        just propagate an exception to `ProxyGraph`, which will broadcast
-        `SIGKILL`.
+        just propagate an exception.
+
+        Raises `RuntimeError` if the node is already running, raises
+        `ValueError` if the node is misconfigured.
 
         For Implementors: `SIGKILL` is the preferred signal on exception
         to prevent active probing.
         """
         ...
+    def _open(self, edge: int, obj: ProxyTCPConnection | ProxyUDPConnection | ProxyTCPSession | ProxyUDPSession):
+        """
+        Push a SYN for a newly constructed connection or session.
+        """
+        if isinstance(obj, ProxyTCPConnection):
+            self._edges[edge][1].put_nowait(ProxyTCPPacket(obj, b"", "SYN")) # type: ignore
+        elif isinstance(obj, ProxyTCPSession):
+            self._edges[edge][1].put_nowait(ProxyTCPMessage(obj, b"", "SYN")) # type: ignore
+        elif isinstance(obj, ProxyUDPConnection):
+            self._edges[edge][1].put_nowait(ProxyUDPPacket(obj, b"", "SYN")) # type: ignore
+        else:
+            self._edges[edge][1].put_nowait(ProxyUDPMessage(obj, b"", "SYN")) # type: ignore
+    def _send(self, edge: int, obj: ProxyTCPConnection | ProxyUDPConnection | ProxyTCPSession | ProxyUDPSession, data: bytes):
+        """
+        Send data to connection or session.
+        """
+        if isinstance(obj, ProxyTCPConnection):
+            self._edges[edge][1].put_nowait(ProxyTCPPacket(obj, data, None)) # type: ignore
+        elif isinstance(obj, ProxyTCPSession):
+            self._edges[edge][1].put_nowait(ProxyTCPMessage(obj, data, None)) # type: ignore
+        elif isinstance(obj, ProxyUDPConnection):
+            self._edges[edge][1].put_nowait(ProxyUDPPacket(obj, data, None)) # type: ignore
+        else:
+            self._edges[edge][1].put_nowait(ProxyUDPMessage(obj, data, None)) # type: ignore
+    def _close(self, edge: int, obj: ProxyTCPConnection | ProxyUDPConnection | ProxyTCPSession | ProxyUDPSession):
+        """
+        Push a FIN for a closing connection or session.
+        """
+        if isinstance(obj, ProxyTCPConnection):
+            self._edges[edge][1].put_nowait(ProxyTCPPacket(obj, b"", "FIN")) # type: ignore
+        elif isinstance(obj, ProxyTCPSession):
+            self._edges[edge][1].put_nowait(ProxyTCPMessage(obj, b"", "FIN")) # type: ignore
+        elif isinstance(obj, ProxyUDPConnection):
+            self._edges[edge][1].put_nowait(ProxyUDPPacket(obj, b"", "FIN")) # type: ignore
+        else:
+            self._edges[edge][1].put_nowait(ProxyUDPMessage(obj, b"", "FIN")) # type: ignore
+    def _reject(self, edge: int, obj: ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage):
+        """
+        Reject packet or message by pushing a FIN back.
+        """
+        if isinstance(obj, ProxyTCPPacket):
+            self._edges[edge][1].put_nowait(ProxyTCPPacket(obj.bound, b"", "FIN")) # type: ignore
+        elif isinstance(obj, ProxyTCPMessage):
+            self._edges[edge][1].put_nowait(ProxyTCPMessage(obj.bound, b"", "FIN")) # type: ignore
+        elif isinstance(obj, ProxyUDPPacket):
+            self._edges[edge][1].put_nowait(ProxyUDPPacket(obj.bound, b"", "FIN")) # type: ignore
+        else:
+            self._edges[edge][1].put_nowait(ProxyUDPMessage(obj.bound, b"", "FIN")) # type: ignore
     def __add__(self, other: ProxyNode | ProxyGraph) -> ProxyGraph:
         """
         Syntactic sugar for putting nodes into graphs.
@@ -327,15 +378,13 @@ class ProxyNode(ABC):
 
 class ProxyGraph:
     """
-    A referential list that groups node together. Only claims node ownership
-    iff the graph is run.
-
-    Used for connecting nodes and managing async runtime.
+    Async runtime manager; A referential list that groups node together.
+    Also used for connecting nodes.
     """
     __slots__ = (
+        "_controller",
         "_nodes",
-        "_running",
-        "_controller"
+        "_running"
     )
     def __init__(self, *nodes: ProxyNode):
         self._nodes: list[ProxyNode] = list(nodes)
@@ -345,11 +394,8 @@ class ProxyGraph:
     def nodes(self) -> list[ProxyNode]:
         """
         Get nodes in the graph.
-
-        Do not mutate when the graph is running.
         """
         return self._nodes
-
     def running(self) -> bool:
         """
         Returns `True` iff the graph is running.
@@ -363,6 +409,9 @@ class ProxyGraph:
         """
         return self._controller
     def __del__(self):
+        """
+        Controller queue lifetime manager.
+        """
         self._controller.shutdown()
     def __add__(self, other: ProxyNode | ProxyGraph) -> ProxyGraph:
         """
@@ -393,7 +442,7 @@ class ProxyGraph:
         Syntactic sugar for connecting nodes & graphs.
 
         Connects LHS `None` edge slots with RHS `None` edge slots
-        in iteration order, until either side is full.
+        in iteration order, until either side is full. (Symmetric)
 
         Raises `RuntimeError` if anything is running.
         """
@@ -438,16 +487,18 @@ class ProxyGraph:
         except StopIteration:
             return self + other
 
-    async def run(self) -> Optional[Exception]:
+    async def run(self) -> Exception | None:
         """
         Run the graph.
 
-        Returns last error.
+        Returns last error; Raises `RuntimeError` instead if any node in
+        the graph is already running.
 
-        To stop the graph, send a control signal.
+        Immediately claims ownership of the nodes; Some nodes might still be
+        internally mutable.
         """
         if self._running or any(node.running() for node in self._nodes):
-            return RuntimeError("Something is already running")
+            raise RuntimeError("Something is already running")
         self._running = True
         _penprox_running_graphs.add(self)
 
@@ -469,7 +520,7 @@ class ProxyGraph:
                             pending.add(controller)
                         else:
                             error = RuntimeError(f"Received {result} from graph nodes")
-                except Exception as e:
+                except Exception as e: # noqa: BLE001
                     error = e
                     for node in self._nodes:
                         node.controller().put_nowait("SIGKILL")
