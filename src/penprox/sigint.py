@@ -16,13 +16,13 @@ def sigint_handler(signum, frame):
         case 0:
             print("[SIGINT=0] Gracefully shutting down graphs...", file=sys.stderr)
             for graph in _penprox_running_graphs:
-                graph.controller().sync_put("SIGTERM")
+                graph.controller().sync_q.put_nowait("SIGTERM")
             _penprox_running_graphs.iter_ok()
             _penprox_sigints += 1
         case 1:
             print("[SIGINT=1] Aborting graphs...", file=sys.stderr)
             for graph in _penprox_running_graphs:
-                graph.controller().sync_put("SIGKILL")
+                graph.controller().sync_q.put_nowait("SIGKILL")
             _penprox_running_graphs.iter_ok()
             _penprox_sigints += 1
         case 2:

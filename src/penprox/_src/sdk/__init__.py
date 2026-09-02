@@ -1,10 +1,7 @@
-"""
-penprox SDK single source of truth. Also exported as penprox library API.
-"""
-
 from __future__ import annotations
 
 import asyncio
+import socket
 from abc import ABC, abstractmethod
 from asyncio import Queue, create_task
 from dataclasses import dataclass
@@ -12,10 +9,10 @@ from ipaddress import IPv4Address, IPv6Address
 from itertools import chain
 from logging import getLogger
 from threading import Lock
-from typing import Literal
+from typing import Literal, cast
 
 import aiodns
-from culsans import Queue as HybridQueue
+from janus import Queue as HybridQueue
 
 logger = getLogger(__name__)
 
@@ -41,15 +38,22 @@ class _RunningGraphs:
 
 _penprox_running_graphs: _RunningGraphs = _RunningGraphs()
 
-_dnsResolver = aiodns.DNSResolver()
+_dnsResolver: aiodns.DNSResolver | None = None
 
 async def queryDNS(domain: str) -> IPv4Address | IPv6Address | None:
-    result = await _dnsResolver.query_dns(domain, "A")
-    if result.answer: 
-        return IPv4Address(result.answer[0].data.addr) # type: ignore
-    result = await _dnsResolver.query_dns(domain, "AAAA")
-    if result.answer:
-        return IPv6Address(result.answer[0].data.addr) # type: ignore
+    global _dnsResolver
+    loop = asyncio.get_running_loop()
+    if _dnsResolver is None or _dnsResolver.loop is not loop:
+        _dnsResolver = aiodns.DNSResolver(loop=loop)
+    try:
+        result = await _dnsResolver.getaddrinfo(domain, socket.AF_INET)
+        if result.nodes: 
+            return IPv4Address(result.nodes[0].addr[0].decode())
+        result = await _dnsResolver.getaddrinfo(domain, socket.AF_INET6)
+        if result.nodes:
+            return IPv6Address(result.nodes[0].addr[0].decode())
+    except aiodns.error.DNSError:
+        return None
 
 @dataclass(eq=False, slots=True, frozen=True)
 class ProxyTCPConnection:
@@ -148,20 +152,20 @@ class ProxyBidict[X, Y]:
             del self._x[self._y[y]]
         self._x[x] = y
         self._y[y] = x
-    def xgety(self, x: X) -> Y:
+    def xgety(self, x: X) -> Y | None:
         """
         Get relation by `X`.
 
         `KeyError` if not exist.
         """
-        return self._x[x]
-    def ygetx(self, y: Y) -> X:
+        return self._x.get(x)
+    def ygetx(self, y: Y) -> X | None:
         """
         Get relation by `Y`.
 
         `KeyError` if not exist.
         """
-        return self._y[y]
+        return self._y.get(y)
     def xdiscard(self, x: X):
         """
         Idempotently remove by X.
@@ -228,7 +232,6 @@ class ProxyNode(ABC):
         Get the version of the node. Formats may differ between nodes.
         """
         return cls._version
-    @abstractmethod
     def edges(self) -> list[ProxyEdgeEnd | None]:
         """
         Get the node's edges.
@@ -236,7 +239,6 @@ class ProxyNode(ABC):
         Unless otherwise documented, do not mutate while running.
         """
         return self._edges # type: ignore
-    @abstractmethod
     def controller(self) -> Queue[ProxySignal]:
         """
         Get the node's controller end. (mpsc)
@@ -247,7 +249,6 @@ class ProxyNode(ABC):
         Returns `True` iff the node is running.
         """
         return self._running # type: ignore
-    @abstractmethod
     def boundary(self) -> bool:
         """
         Returns `True` iff the node is a SIGTERM boundary node.
@@ -319,6 +320,11 @@ class ProxyNode(ABC):
             self._edges[edge][1].put_nowait(ProxyUDPPacket(obj.bound, b"", "FIN")) # type: ignore
         else:
             self._edges[edge][1].put_nowait(ProxyUDPMessage(obj.bound, b"", "FIN")) # type: ignore
+    def _forward(self, edge: int, obj: ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage):
+        """
+        Forward a packet.
+        """
+        self._edges[edge][1].put_nowait(obj) # type: ignore
     def __add__(self, other: ProxyNode | ProxyGraph) -> ProxyGraph:
         """
         Syntactic sugar for putting nodes into graphs.
@@ -331,7 +337,7 @@ class ProxyNode(ABC):
             return ProxyGraph(self, other)
         other.nodes().append(self)
         return other
-    def __gt__(self, other: ProxyNode | ProxyGraph) -> ProxyGraph:
+    def __rshift__(self, other: ProxyNode | ProxyGraph) -> ProxyGraph:
         """
         Syntactic sugar for connecting nodes & graphs.
 
@@ -437,7 +443,7 @@ class ProxyGraph:
         self._nodes += other._nodes
         return self
 
-    def __gt__(self, other: ProxyNode | ProxyGraph):
+    def __rshift__(self, other: ProxyNode | ProxyGraph):
         """
         Syntactic sugar for connecting nodes & graphs.
 
@@ -503,7 +509,7 @@ class ProxyGraph:
         _penprox_running_graphs.add(self)
 
         pending = {create_task(node.run()) for node in self._nodes}
-        controller = create_task(self._controller.async_get())
+        controller = create_task(self._controller.async_q.get())
         pending.add(controller)
         error = None
         
@@ -511,16 +517,21 @@ class ProxyGraph:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 try:
-                    result = task.result()
+                    result = cast(ProxySignal, task.result())
                     if result:
+                        logger.info(f"Broadcasting {result} to all nodes in the graph")
                         for node in self._nodes:
                             node.controller().put_nowait(result)
                         if task is controller:
-                            controller = create_task(self._controller.async_get())
-                            pending.add(controller)
+                            if pending:
+                                controller = create_task(self._controller.async_q.get())
+                                pending.add(controller)
                         else:
                             error = RuntimeError(f"Received {result} from graph nodes")
+                    elif len(pending) == 1 and next(iter(pending)) is controller:
+                        return
                 except Exception as e: # noqa: BLE001
+                    logger.error(f"Graph received exception {e}")
                     error = e
                     for node in self._nodes:
                         node.controller().put_nowait("SIGKILL")

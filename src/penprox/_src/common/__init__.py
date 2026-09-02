@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import socket
-from asyncio import Queue, create_task
-from ipaddress import IPv4Address, IPv6Address
 from logging import getLogger
 
 from ..sdk import *
@@ -95,7 +92,7 @@ class UpstreamTCPNode(ProxyNode):
     async def _dispatch(self) -> None:
         try:
             while True:
-                packet: ProxyTCPPacket = await self._edges[0][0].get() # type: ignore
+                packet = cast(ProxyTCPPacket, await self._edges[0][0].get()) # type: ignore
                 if packet.flag == "SYN":
                     logger.error("UpstreamTCPNode: Received SYN packet from downstream")
                     self._reject(0, packet)
@@ -107,7 +104,7 @@ class UpstreamTCPNode(ProxyNode):
                     continue
                 transport.write(packet.data)
                 if packet.flag == "FIN":
-                    # We'll leave the rest to connection_lost
+                    # We'll send back a FIN anyway...
                     transport.close()
                     continue
         except asyncio.CancelledError:
@@ -161,7 +158,7 @@ class UpstreamTCPNode(ProxyNode):
                 dispatcher.cancel()
                 self._running = False
                 return None if self._signal else "SIGKILL"
-            signal = done.pop().result()
+            signal = cast(ProxySignal, done.pop().result())
             logger.info(f"UpstreamTCPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
@@ -252,7 +249,7 @@ class UpstreamUDPNode(ProxyNode):
     async def _dispatch(self) -> None:
         try:
             while True:
-                packet: ProxyUDPPacket = await self._edges[0][0].get() # type: ignore
+                packet = cast(ProxyUDPPacket, await self._edges[0][0].get()) # type: ignore
                 if packet.flag == "SYN":
                    logger.error("UpstreamUDPNode: Received SYN packet from downstream")
                    self._reject(0, packet)
@@ -314,7 +311,7 @@ class UpstreamUDPNode(ProxyNode):
                 self._transport.close()
                 self._running = False
                 return None if self._signal else "SIGKILL"
-            signal = done.pop().result()
+            signal = cast(ProxySignal, done.pop().result())
             logger.info(f"UpstreamUDPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
@@ -372,7 +369,7 @@ class DownstreamTCPNode(ProxyNode):
     async def _dispatch(self) -> None:
         try:
             while True:
-                packet: ProxyTCPPacket = await self._edges[0][0].get() # type: ignore
+                packet = cast(ProxyTCPPacket, await self._edges[0][0].get()) # type: ignore
                 if packet.flag == "SYN":
                     if self._signal == "SIGTERM" and self._boundary:
                         self._reject(0, packet)
@@ -402,7 +399,7 @@ class DownstreamTCPNode(ProxyNode):
                     continue
                 transport.write(packet.data)
                 if packet.flag == "FIN":
-                    # We'll leave the rest to connection_lost
+                    # We'll send back a FIN anyway...
                     transport.close()
                     continue
         except asyncio.CancelledError:
@@ -435,7 +432,7 @@ class DownstreamTCPNode(ProxyNode):
             if dispatcher in done:
                 self._running = False
                 return None if self._signal else "SIGKILL"
-            signal = done.pop().result()
+            signal = cast(ProxySignal, done.pop().result())
             logger.info(f"DownstreamTCPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
@@ -493,7 +490,7 @@ class DownstreamUDPNode(ProxyNode):
     async def _dispatch(self) -> None:
         try:
             while True:
-                packet: ProxyUDPPacket = await self._edges[0][0].get() # type: ignore
+                packet = cast(ProxyUDPPacket, await self._edges[0][0].get()) # type: ignore
                 if self._transport.is_closing():
                     raise ConnectionError("Unexpected transport close")
                 if packet.flag == "SYN":
@@ -543,7 +540,7 @@ class DownstreamUDPNode(ProxyNode):
                 self._transport.close()
                 self._running = False
                 return None if self._signal else "SIGKILL"
-            signal = done.pop().result()
+            signal = cast(ProxySignal, done.pop().result())
             logger.info(f"DownstreamUDPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
@@ -613,10 +610,11 @@ class ExitServerNode(ProxyNode):
             for task in done:
                 match task:
                     case _ if task is upstream:
-                        message: ProxyTCPMessage | ProxyUDPMessage = upstream.result()
+                        message = cast(ProxyTCPMessage | ProxyUDPMessage, upstream.result())
                         if message.flag == "SYN":
                             if self._signal == "SIGTERM" and self._boundary:
                                 self._reject(0, message)
+                                upstream = create_task(self._edges[0][0].get()) # type: ignore
                                 continue
                             # DNS
                             target = message.bound.host
@@ -627,6 +625,7 @@ class ExitServerNode(ProxyNode):
                                 if not target:
                                     logger.debug(f"ExitServerNode: Failed to resolve {message.bound.host}, rejecting upstream session")
                                     self._reject(0, message)
+                                    upstream = create_task(self._edges[0][0].get()) # type: ignore
                                     continue
                                 message.bound.host = target
                             # Connection construction
@@ -638,8 +637,10 @@ class ExitServerNode(ProxyNode):
                         else:
                             connection = self._map.xgety(message.bound)
                         if not connection:
-                            logger.error("ExitServerNode: Received message with unknown session")
-                            self._reject(0, message)
+                            if message.flag != "FIN":
+                                logger.debug("ExitServerNode: Received message with unknown session")
+                                self._reject(0, message)
+                            upstream = create_task(self._edges[0][0].get()) # type: ignore
                             continue
                         elif isinstance(connection, ProxyTCPConnection):
                             self._edges[1][1].put_nowait( # type: ignore
@@ -656,15 +657,18 @@ class ExitServerNode(ProxyNode):
                                 return
                         upstream = create_task(self._edges[0][0].get()) # type: ignore
                     case _ if task is downstream:
-                        packet: ProxyTCPPacket | ProxyUDPPacket = downstream.result()
+                        packet = cast(ProxyTCPPacket | ProxyUDPPacket, downstream.result())
                         if packet.flag == "SYN":
                             logger.error("ExitSereverNode: Received SYN packet from downstream")
                             self._reject(1, packet)
+                            downstream = create_task(self._edges[1][0].get()) # type: ignore
                             continue
                         session = self._map.ygetx(packet.bound)
                         if not session:
-                            logger.error("ExitServerNode: Received regular packet with unknown session")
-                            self._reject(1, packet)
+                            if packet.flag != "FIN":
+                                logger.debug("ExitServerNode: Received regular packet with unknown session")
+                                self._reject(1, packet)
+                            downstream = create_task(self._edges[1][0].get()) # type: ignore
                             continue
                         if isinstance(session, ProxyTCPSession):
                             self._edges[0][1].put_nowait( # type: ignore
@@ -680,8 +684,8 @@ class ExitServerNode(ProxyNode):
                                 self._running = False
                                 return
                         downstream = create_task(self._edges[1][0].get()) # type: ignore
-                    case _ if task is controller:
-                        signal = controller.result()
+                    case _: # controller
+                        signal = cast(ProxySignal, controller.result())
                         logger.info(f"ExitServerNode: Received {signal} signal")
                         if signal == "SIGKILL":
                             self._running = False
@@ -692,7 +696,6 @@ class ExitServerNode(ProxyNode):
                                 return
                             self._signal = "SIGTERM"
                         controller = create_task(self._controller.get())
-
 
 class MuxTCPUDPNode(ProxyNode):
     """
@@ -718,43 +721,6 @@ class MuxTCPUDPNode(ProxyNode):
         self._running: bool = False
         self._boundary: bool = boundary
 
-    def _forward(self, edge: int, obj: ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage) -> bool:
-        """
-        `tcp` & `udp` forward routing.
-
-        `True` iff run should terminate.
-        """
-        if obj.flag == "SYN":
-            if self._signal == "SIGTERM" and self._boundary:
-                self._reject(edge, obj)
-                return False
-            self._pool.add(obj.bound)
-        self._edges[2][1].put_nowait(obj) # type: ignore
-        if obj.flag == "FIN":
-            self._pool.discard(obj.bound)
-            if self._signal == "SIGTERM" and not self._pool:
-                return True
-        return False
-    def _backward(self, obj: ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage) -> bool:
-        """
-        `mux` backward routing.
-
-        `True` iff run should terminate.
-        """
-        if obj.flag == "SYN":
-            # Never
-            logger.error("MuxTCPUDPNode: Received SYN request from downstream, rejecting")
-            self._reject(2, obj)
-            return False
-        if isinstance(obj, ProxyTCPPacket | ProxyTCPMessage):
-            self._edges[0][1].put_nowait(obj) # type: ignore
-        else:
-            self._edges[1][1].put_nowait(obj) # type: ignore
-        if obj.flag == "FIN":
-            self._pool.discard(obj.bound)
-            if self._signal == "SIGTERM" and not self._pool:
-                return True
-        return False
     async def run(self) -> ProxySignal | None:
         """
         Run `MuxTCPUDPNode`.
@@ -786,22 +752,29 @@ class MuxTCPUDPNode(ProxyNode):
             for task in done:
                 match task:
                     case _ if task is tcp:
-                        if self._forward(0, tcp.result()):
-                            self._running = False
-                            return
+                        packet = cast(ProxyTCPPacket | ProxyTCPMessage, tcp.result())
                         tcp = create_task(self._edges[0][0].get()) # type: ignore
                     case _ if task is udp:
-                        if self._forward(1, udp.result()):
-                            self._running = False
-                            return
+                        packet = cast(ProxyUDPPacket | ProxyUDPMessage, udp.result())
                         udp = create_task(self._edges[1][0].get()) # type: ignore
                     case _ if task is mux:
-                        if self._backward(mux.result()):
-                            self._running = False
-                            return
+                        packet = cast(ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage, mux.result())
+                        if packet.flag == "SYN":
+                            # Never
+                            logger.error("MuxTCPUDPNode: Received SYN request from downstream, rejecting")
+                            self._reject(2, packet)
+                            mux = create_task(self._edges[2][0].get()) # type: ignore
+                            continue
+                        self._forward(int(isinstance(packet, ProxyUDPPacket | ProxyUDPMessage)), packet)
+                        if packet.flag == "FIN":
+                            self._pool.discard(packet.bound)
+                            if self._signal == "SIGTERM" and not self._pool:
+                                self._running = False
+                                return
                         mux = create_task(self._edges[2][0].get()) # type: ignore
-                    case _ if task is controller:
-                        signal = controller.result()
+                        continue
+                    case _: # controller
+                        signal = cast(ProxySignal, controller.result())
                         logger.info(f"MuxTCPUDPNode: Received {signal} signal")
                         if signal == "SIGKILL":
                             self._running = False
@@ -811,7 +784,19 @@ class MuxTCPUDPNode(ProxyNode):
                                 self._running = False
                                 return
                             self._signal = "SIGTERM"
-                            controller = create_task(self._controller.get())
+                        controller = create_task(self._controller.get())
+                        continue
+                if packet.flag == "SYN":
+                    if self._signal == "SIGTERM" and self._boundary:
+                        self._reject(int(isinstance(packet, (ProxyUDPPacket, ProxyUDPMessage))), packet)
+                        continue
+                    self._pool.add(packet.bound)
+                self._forward(2, packet)
+                if packet.flag == "FIN":
+                    self._pool.discard(packet.bound)
+                    if self._signal == "SIGTERM" and not self._pool:
+                        self._running = False
+                        return
 
 class DemuxTCPUDPNode(ProxyNode):
     """
@@ -836,43 +821,6 @@ class DemuxTCPUDPNode(ProxyNode):
         self._running: bool = False
         self._boundary: bool = boundary
 
-    def _forward(self, obj: ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage) -> bool:
-        """
-        `mux` forward routing.
-
-        `True` iff run should terminate.
-        """
-        if obj.flag == "SYN":
-            if self._signal == "SIGTERM" and self._boundary:
-                self._reject(0, obj)
-                return False
-            self._pool.add(obj.bound)
-        if isinstance(obj, ProxyTCPPacket | ProxyTCPMessage):
-            self._edges[1][1].put_nowait(obj) # type: ignore
-        else:
-            self._edges[2][1].put_nowait(obj) # type: ignore
-        if obj.flag == "FIN":
-            self._pool.discard(obj.bound)
-            if self._signal == "SIGTERM" and not self._pool:
-                return True
-        return False
-    def _backward(self, edge: int, obj: ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage) -> bool:
-        """
-        `tcp` & `udp` backward routing.
-
-        `True` iff run should terminate.
-        """
-        if obj.flag == "SYN":
-            # Never
-            logger.error("DemuxTCPUDPNode: Received SYN request from downstream, rejecting")
-            self._reject(edge, obj)
-            return False
-        self._edges[0][1].put_nowait(obj) # type: ignore
-        if obj.flag == "FIN":
-            self._pool.discard(obj.bound)
-            if self._signal == "SIGTERM" and not self._pool:
-                return True
-        return False
     async def run(self) -> ProxySignal | None:
         """
         Run `DemuxTCPUDPNode`.
@@ -904,22 +852,29 @@ class DemuxTCPUDPNode(ProxyNode):
             for task in done:
                 match task:
                     case _ if task is mux:
-                        if self._forward(mux.result()):
-                            self._running = False
-                            return
+                        packet = cast(ProxyTCPPacket | ProxyUDPPacket | ProxyTCPMessage | ProxyUDPMessage, mux.result())
+                        if packet.flag == "SYN":
+                            if self._signal == "SIGTERM" and self._boundary:
+                                self._reject(0, packet)
+                                mux = create_task(self._edges[0][0].get()) # type: ignore
+                                continue
+                            self._pool.add(packet.bound)
+                        self._forward(1 + int(isinstance(packet, ProxyUDPPacket | ProxyUDPMessage)), packet)
+                        if packet.flag == "FIN":
+                            self._pool.discard(packet.bound)
+                            if self._signal == "SIGTERM" and not self._pool:
+                                self._running = False
+                                return
                         mux = create_task(self._edges[0][0].get()) # type: ignore
-                    case _ if task is tcp:
-                        if self._backward(1, tcp.result()):
-                            self._running = False
-                            return
+                        continue
+                    case _ if task is tcp or task is udp:
+                        packet = cast(ProxyTCPPacket | ProxyTCPMessage, tcp.result())
                         tcp = create_task(self._edges[1][0].get()) # type: ignore
                     case _ if task is udp:
-                        if self._backward(2, udp.result()):
-                            self._running = False
-                            return
-                        udp = create_task(self._edges[2][0].get()) # type: ignore
-                    case _ if task is controller:
-                        signal = controller.result()
+                        packet = cast(ProxyUDPPacket | ProxyUDPMessage, udp.result())
+                        udp = create_task(self._edges[1][0].get()) # type: ignore
+                    case _: # controller
+                        signal = cast(ProxySignal, controller.result())
                         logger.info(f"DemuxTCPUDPNode: Received {signal} signal")
                         if signal == "SIGKILL":
                             self._running = False
@@ -929,4 +884,16 @@ class DemuxTCPUDPNode(ProxyNode):
                                 self._running = False
                                 return
                             self._signal = "SIGTERM"
-                            controller = create_task(self._controller.get())
+                        controller = create_task(self._controller.get())
+                        continue
+                if packet.flag == "SYN":
+                    # Never
+                    logger.error("DemuxTCPUDPNode: Received SYN request from downstream, rejecting")
+                    self._reject(1 + isinstance(packet, (ProxyUDPPacket, ProxyUDPMessage)), packet)
+                    continue
+                self._forward(0, packet)
+                if packet.flag == "FIN":
+                    self._pool.discard(packet.bound)
+                    if self._signal == "SIGTERM" and not self._pool:
+                        self._running = False
+                        return

@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 license = "Unlicense"
 dependencies = [
     "aiodns>=4.0.4",
-    "culsans>=0.11.0",
+    "janus>=2.0.0",
 ]
 
 [build-system]
@@ -21,5 +21,14 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
+    "penprox",
     "ruff>=0.16.5",
 ]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+penprox = { workspace = true }
