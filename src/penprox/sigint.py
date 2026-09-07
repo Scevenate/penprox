@@ -1,30 +1,29 @@
 """
-A drop-in import that broadcasts signals to all running graphs when
-received system SIGINT.
+A drop-in import that registers a SIGINT handler for shutting graphs down.
 """
 
 import signal
 import sys
 
-from ._src.sdk import _penprox_running_graphs
+from ._src.sdk import penprox_running_graphs
 
-_penprox_sigints = 0
+penprox_sigints = 0
 
 def sigint_handler(signum, frame):
-    global _penprox_sigints
-    match _penprox_sigints:
+    global penprox_sigints
+    match penprox_sigints:
         case 0:
             print("[SIGINT=0] Gracefully shutting down graphs...", file=sys.stderr)
-            for graph in _penprox_running_graphs:
+            for graph in penprox_running_graphs:
                 graph.controller().sync_q.put_nowait("SIGTERM")
-            _penprox_running_graphs.iter_ok()
-            _penprox_sigints += 1
+            penprox_running_graphs.iter_ok()
+            penprox_sigints += 1
         case 1:
             print("[SIGINT=1] Aborting graphs...", file=sys.stderr)
-            for graph in _penprox_running_graphs:
+            for graph in penprox_running_graphs:
                 graph.controller().sync_q.put_nowait("SIGKILL")
-            _penprox_running_graphs.iter_ok()
-            _penprox_sigints += 1
+            penprox_running_graphs.iter_ok()
+            penprox_sigints += 1
         case 2:
             print("[SIGINT=2] exit(1)", file=sys.stderr)
             sys.exit(1)

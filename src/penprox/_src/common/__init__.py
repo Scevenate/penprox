@@ -76,6 +76,7 @@ class UpstreamTCPNode(ProxyNode):
                 connection = ProxyTCPConnection(IPv4Address(peerName[0]), peerName[1])
             else: # v6
                 connection = ProxyTCPConnection(IPv6Address(peerName[0]), peerName[1])
+            logger.debug(f"UpstreamTCPNode: New connection {connection}")
             self._connection: ProxyTCPConnection = connection
             self._node._connections[connection] = transport
             self._node._open(0, connection)
@@ -84,6 +85,7 @@ class UpstreamTCPNode(ProxyNode):
         def connection_lost(self, exc: Exception | None) -> None:
             if exc:
                 logger.error(f"UpstreamTCPNode: Received {exc} when closing connection")
+            logger.debug(f"UpstreamTCPNode: Connection closed {self._connection}")
             self._node._close(0, self._connection)
             self._node._connections.pop(self._connection, None)
             if self._node._signal == "SIGTERM" and not self._node._connections:
@@ -165,6 +167,7 @@ class UpstreamTCPNode(ProxyNode):
                 server.cancel()
                 dispatcher.cancel()
                 self._running = False
+                logger.info("UpstreamTCPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
             controller = create_task(self._controller.get())
@@ -239,6 +242,7 @@ class UpstreamUDPNode(ProxyNode):
             if not connection:
                 if node._signal == "SIGTERM" and node._boundary:
                     return
+                logger.debug(f"UpstreamUDPNode: New connection {connection}")
                 connection = ProxyUDPConnection(*address)
                 node._connections[address] = connection
                 node._open(0, connection)
@@ -258,6 +262,7 @@ class UpstreamUDPNode(ProxyNode):
                     raise ConnectionError("UpstreamUDPNode: Unexpected transport closure")
                 self._transport.sendto(packet.data, (packet.bound.host, packet.bound.port))
                 if packet.flag == "FIN":
+                    logger.debug(f"UpstreamUDPNode: Connection closed {packet.bound}")
                     self._connections.pop((packet.bound.host, packet.bound.port), None)
                     if self._signal == "SIGTERM" and not self._connections:
                         self._controller.put_nowait("SIGKILL")
@@ -318,6 +323,7 @@ class UpstreamUDPNode(ProxyNode):
                 dispatcher.cancel()
                 self._transport.close()
                 self._running = False
+                logger.info("UpstreamUDPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
             controller = create_task(self._controller.get())
@@ -357,10 +363,14 @@ class DownstreamTCPNode(ProxyNode):
             transport: asyncio.Transport
         ):
             # SYN from upstream only, guarding SIGTERM boundary in dispatcher
+            logger.debug(f"UpstreamUDPNode: New connection {self._connection}")
             self._node._connections[self._connection] = transport
         def data_received(self, data: bytes) -> None:
             self._node._send(0, self._connection, data)
         def connection_lost(self, exc: Exception | None) -> None:
+            if exc:
+                logger.error(f"DownstreamTCPNode: Received {exc} when closing connection")
+            logger.debug(f"DownstreamTCPNode: Connection closed: {self._connection}")
             self._node._close(0, self._connection)
             self._node._connections.pop(self._connection, None)
             if self._node._signal == "SIGTERM" and not self._node._connections:
@@ -440,6 +450,7 @@ class DownstreamTCPNode(ProxyNode):
                     transport.close()
                 dispatcher.cancel()
                 self._running = False
+                logger.info("DownstreamTCPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
             controller = create_task(self._controller.get())
@@ -497,9 +508,11 @@ class DownstreamUDPNode(ProxyNode):
                     if self._signal == "SIGTERM" and self._boundary:
                         self._reject(0, packet)
                         continue
+                    logger.debug(f"DownstreamUDPNode: New connection {packet.bound}")
                     self._connections[(packet.bound.host, packet.bound.port)] = packet.bound
                 self._transport.sendto(packet.data, (packet.bound.host, packet.bound.port))
                 if packet.flag == "FIN":
+                    logger.debug(f"DownstreamUDPNode: Connection closed {packet.bound}")
                     self._connections.pop((packet.bound.host, packet.bound.port), None)
                     if self._signal == "SIGTERM" and not self._connections:
                         self._controller.put_nowait("SIGKILL")
@@ -548,17 +561,18 @@ class DownstreamUDPNode(ProxyNode):
                 if self._transport:
                     self._transport.close()
                 self._running = False
+                logger.info("DownstreamUDPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
             controller = create_task(self._controller.get())
 
-class ExitServerNode(ProxyNode):
+class ExitNode(ProxyNode):
     """
     Exit server node that resolves proxy sessions locally.
 
     Has one `ProxyMessage` upstream and one `ProxyPacket` downstream.
 
-    Resolves request domain name by system DNS. Consider adding
+    Resolves request domain name by local DNS. Consider adding
     a DNS middleware node if you want custom DNS resolution.
 
     Serves both TCP and UDP. Consider adding a demultiplexing node if you
@@ -581,15 +595,15 @@ class ExitServerNode(ProxyNode):
 
     async def run(self) -> ProxySignal | None:
         """
-        Run `ExitServerNode`.
+        Run `ExitNode`.
         """
         if self._running:
-            logger.critical("Attempted to run a running ExitServerNode")
+            logger.critical("Attempted to run a running ExitNode")
             return "SIGKILL"
         if len(self._edges) != 2 or not all(self._edges):
-            logger.critical("Running improperly connected ExitServerNode")
+            logger.critical("Running improperly connected ExitNode")
             return "SIGKILL"
-        logger.info("Running ExitServerNode...")
+        logger.info("Running ExitNode...")
         self._running = True
         self._map: ProxyBidict[
             ProxyTCPSession | ProxyUDPSession,
@@ -616,30 +630,24 @@ class ExitServerNode(ProxyNode):
                                 self._reject(0, message)
                                 upstream = create_task(self._edges[0][0].get()) # type: ignore
                                 continue
+                            logger.debug(f"ExitNode: New session to {message.bound.host}")
                             # DNS
-                            target = message.bound.host
-                            if isinstance(target, str):
-                                target = await queryDNS(target)
-                            # prevent resolve race
-                            if isinstance(message.bound.host, str):
-                                if not target:
-                                    logger.debug(f"ExitServerNode: Failed to resolve {message.bound.host}, rejecting upstream session")
-                                    self._reject(0, message)
-                                    upstream = create_task(self._edges[0][0].get()) # type: ignore
-                                    continue
-                                message.bound.host = target
+                            if not await resolveDNS(message.bound):
+                                logger.debug(f"ExitNode: Failed to resolve {message.bound.host}, rejecting upstream session")
+                                self._reject(0, message)
+                                upstream = create_task(self._edges[0][0].get()) # type: ignore
+                                continue
+                            host = cast(IPv4Address | IPv6Address, message.bound.host)
                             # Connection construction
                             if isinstance(message, ProxyTCPMessage):
-                                connection = ProxyTCPConnection(message.bound.host, message.bound.port)
+                                connection = ProxyTCPConnection(host, message.bound.port)
                             else:
-                                connection = ProxyUDPConnection(message.bound.host, message.bound.port)
+                                connection = ProxyUDPConnection(host, message.bound.port)
                             self._map.set(message.bound, connection)
                         else:
                             connection = self._map.xgety(message.bound)
                         if not connection:
-                            if message.flag != "FIN":
-                                logger.debug("ExitServerNode: Received message with unknown session")
-                                self._reject(0, message)
+                            self._reject(0, message)
                             upstream = create_task(self._edges[0][0].get()) # type: ignore
                             continue
                         elif isinstance(connection, ProxyTCPConnection):
@@ -651,8 +659,10 @@ class ExitServerNode(ProxyNode):
                                 ProxyUDPPacket(connection, message.data, message.flag)
                             )
                         if message.flag == "FIN":
+                            logger.debug(f"ExitNode: Session closed {message.bound}")
                             self._map.ydiscard(connection)
                             if self._signal == "SIGTERM" and self._map.empty():
+                                logger.info("ExitNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                         upstream = create_task(self._edges[0][0].get()) # type: ignore
@@ -665,9 +675,7 @@ class ExitServerNode(ProxyNode):
                             continue
                         session = self._map.ygetx(packet.bound)
                         if not session:
-                            if packet.flag != "FIN":
-                                logger.debug("ExitServerNode: Received regular packet with unknown session")
-                                self._reject(1, packet)
+                            self._reject(1, packet)
                             downstream = create_task(self._edges[1][0].get()) # type: ignore
                             continue
                         if isinstance(session, ProxyTCPSession):
@@ -681,17 +689,19 @@ class ExitServerNode(ProxyNode):
                         if packet.flag == "FIN":
                             self._map.ydiscard(packet.bound)
                             if self._signal == "SIGTERM" and self._map.empty():
+                                logger.info("ExitNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                         downstream = create_task(self._edges[1][0].get()) # type: ignore
                     case _: # controller
                         signal = cast(ProxySignal, controller.result())
-                        logger.info(f"ExitServerNode: Received {signal} signal")
+                        logger.info(f"ExitNode: Received {signal} signal")
                         if signal == "SIGKILL":
                             self._running = False
                             return
                         if signal == "SIGTERM":
                             if self._map.empty():
+                                logger.info("ExitNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                             self._signal = "SIGTERM"
@@ -769,6 +779,7 @@ class MuxTCPUDPNode(ProxyNode):
                         if packet.flag == "FIN":
                             self._pool.discard(packet.bound)
                             if self._signal == "SIGTERM" and not self._pool:
+                                logger.info("MuxTCPUDPNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                         mux = create_task(self._edges[2][0].get()) # type: ignore
@@ -781,6 +792,7 @@ class MuxTCPUDPNode(ProxyNode):
                             return
                         if signal == "SIGTERM":
                             if not self._pool:
+                                logger.info("MuxTCPUDPNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                             self._signal = "SIGTERM"
@@ -795,6 +807,7 @@ class MuxTCPUDPNode(ProxyNode):
                 if packet.flag == "FIN":
                     self._pool.discard(packet.bound)
                     if self._signal == "SIGTERM" and not self._pool:
+                        logger.info("MuxTCPUDPNode: All connection served, quitting (SIGTERM)")
                         self._running = False
                         return
 
@@ -863,6 +876,7 @@ class DemuxTCPUDPNode(ProxyNode):
                         if packet.flag == "FIN":
                             self._pool.discard(packet.bound)
                             if self._signal == "SIGTERM" and not self._pool:
+                                logger.info("DemuxTCPUDPNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                         mux = create_task(self._edges[0][0].get()) # type: ignore
@@ -881,6 +895,7 @@ class DemuxTCPUDPNode(ProxyNode):
                             return
                         if signal == "SIGTERM":
                             if not self._pool:
+                                logger.info("DemuxTCPUDPNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 return
                             self._signal = "SIGTERM"
@@ -895,5 +910,6 @@ class DemuxTCPUDPNode(ProxyNode):
                 if packet.flag == "FIN":
                     self._pool.discard(packet.bound)
                     if self._signal == "SIGTERM" and not self._pool:
+                        logger.info("DemuxTCPUDPNode: All connection served, quitting (SIGTERM)")
                         self._running = False
                         return

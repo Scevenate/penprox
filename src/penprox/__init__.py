@@ -10,7 +10,7 @@ from ._src.common import (
     DemuxTCPUDPNode,
     DownstreamTCPNode,
     DownstreamUDPNode,
-    ExitServerNode,
+    ExitNode,
     MuxTCPUDPNode,
     UpstreamTCPNode,
     UpstreamUDPNode,

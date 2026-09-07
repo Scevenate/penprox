@@ -16,4 +16,6 @@ from ._src.sdk import (
     ProxyUDPPacket,
     ProxyUDPSession,
     queryDNS,
+    resolveDNS,
+    waitDNS,
 )

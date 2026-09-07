@@ -16,7 +16,7 @@ from janus import Queue as HybridQueue
 
 logger = getLogger(__name__)
 
-class _RunningGraphs:
+class RunningGraphs:
     __slots__ = (
         "_lock",
         "_set"
@@ -36,24 +36,57 @@ class _RunningGraphs:
     def iter_ok(self):
         self._lock.release()
 
-_penprox_running_graphs: _RunningGraphs = _RunningGraphs()
+penprox_running_graphs: RunningGraphs = RunningGraphs()
 
-_dnsResolver: aiodns.DNSResolver | None = None
+def waitDNS(host: str) -> IPv4Address | IPv6Address:
+    """
+    Simple synchronous system DNS lookup. Raises exception if fails.
+    """
+    addrInfo = socket.getaddrinfo(host, None, socket.AF_UNSPEC)
+    for addr in addrInfo:
+        match addr[0]:
+            case socket.AF_INET:
+                return IPv4Address(addr[4][0])
+            case socket.AF_INET6:
+                return IPv6Address(addr[4][0])
+    raise socket.gaierror(f"{host} DNS lookup did not return any address")
+
+dnsResolver: aiodns.DNSResolver | None = None
 
 async def queryDNS(domain: str) -> IPv4Address | IPv6Address | None:
-    global _dnsResolver
+    """
+    DNS lookup by async runtime local DNS server.
+    """
+    global dnsResolver
     loop = asyncio.get_running_loop()
-    if _dnsResolver is None or _dnsResolver.loop is not loop:
-        _dnsResolver = aiodns.DNSResolver(loop=loop)
+    if dnsResolver is None or dnsResolver.loop is not loop:
+        dnsResolver = aiodns.DNSResolver(loop=loop)
     try:
-        result = await _dnsResolver.getaddrinfo(domain, socket.AF_INET)
+        result = await dnsResolver.getaddrinfo(domain, socket.AF_INET)
         if result.nodes: 
             return IPv4Address(result.nodes[0].addr[0].decode())
-        result = await _dnsResolver.getaddrinfo(domain, socket.AF_INET6)
+        result = await dnsResolver.getaddrinfo(domain, socket.AF_INET6)
         if result.nodes:
             return IPv6Address(result.nodes[0].addr[0].decode())
     except aiodns.error.DNSError:
         return None
+
+async def resolveDNS(bound: ProxyTCPSession | ProxyUDPSession) -> bool:
+    """
+    Idempotently resolve `ProxyTCPSession` / `ProxyUDPSession` by async runtime
+    local DNS server.
+
+    Returns `False` if failed.
+    """
+    if not isinstance(bound.host, str):
+        return True
+    answer = await queryDNS(bound.host)
+    # Async resolve race
+    if isinstance(bound.host, str):
+        if not answer:
+            return False
+        bound.host = answer
+    return True
 
 @dataclass(eq=False, slots=True, frozen=True)
 class ProxyTCPConnection:
@@ -506,7 +539,7 @@ class ProxyGraph:
         if self._running or any(node.running() for node in self._nodes):
             raise RuntimeError("Something is already running")
         self._running = True
-        _penprox_running_graphs.add(self)
+        penprox_running_graphs.add(self)
 
         pending = {create_task(node.run()) for node in self._nodes}
         controller = create_task(self._controller.async_q.get())
@@ -519,7 +552,7 @@ class ProxyGraph:
                 try:
                     result = cast(ProxySignal, task.result())
                     if result:
-                        logger.info(f"Broadcasting {result} to all nodes in the graph")
+                        logger.info(f"ProxyGraph: Broadcasting {result} to all nodes in the graph")
                         for node in self._nodes:
                             node.controller().put_nowait(result)
                         if task is controller:
@@ -531,10 +564,10 @@ class ProxyGraph:
                     elif len(pending) == 1 and next(iter(pending)) is controller:
                         return
                 except Exception as e: # noqa: BLE001
-                    logger.error(f"Graph received exception {e}")
+                    logger.error(f"ProxyGraph: Received exception {e}")
                     error = e
                     for node in self._nodes:
                         node.controller().put_nowait("SIGKILL")
         self._running = False
-        _penprox_running_graphs.remove(self)
+        penprox_running_graphs.remove(self)
         return error
