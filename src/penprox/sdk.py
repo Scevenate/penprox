@@ -1,21 +1,26 @@
 """
-Underlying framework structures used by penprox.
+Underlying structures used by penprox.
 """
 
 # ruff: noqa: F401
 
-from ._src.sdk import (
-    ProxyBidict,
-    ProxySignal,
-    ProxyTCPConnection,
-    ProxyTCPMessage,
-    ProxyTCPPacket,
-    ProxyTCPSession,
-    ProxyUDPConnection,
-    ProxyUDPMessage,
-    ProxyUDPPacket,
-    ProxyUDPSession,
-    queryDNS,
-    resolveDNS,
+from ._src.dns import (
+    DNSInterface,
+    dnsResolver,
     waitDNS,
+)
+from ._src.sdk import (
+    Bidict,
+    LRUTTLDict,
+    Signal,
+    TCPConnection,
+    TCPMessage,
+    TCPPacket,
+    TCPSession,
+    UDPConnection,
+    UDPMessage,
+    UDPPacket,
+    UDPSession,
+    RunningGraphs,
+    running_graphs,
 )

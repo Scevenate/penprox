@@ -5,7 +5,7 @@ A drop-in import that registers a SIGINT handler for shutting graphs down.
 import signal
 import sys
 
-from ._src.sdk import penprox_running_graphs
+from ._src.sdk import running_graphs
 
 penprox_sigints = 0
 
@@ -14,15 +14,15 @@ def sigint_handler(signum, frame):
     match penprox_sigints:
         case 0:
             print("[SIGINT=0] Gracefully shutting down graphs...", file=sys.stderr)
-            for graph in penprox_running_graphs:
+            for graph in running_graphs:
                 graph.controller().sync_q.put_nowait("SIGTERM")
-            penprox_running_graphs.iter_ok()
+            running_graphs.iter_ok()
             penprox_sigints += 1
         case 1:
             print("[SIGINT=1] Aborting graphs...", file=sys.stderr)
-            for graph in penprox_running_graphs:
+            for graph in running_graphs:
                 graph.controller().sync_q.put_nowait("SIGKILL")
-            penprox_running_graphs.iter_ok()
+            running_graphs.iter_ok()
             penprox_sigints += 1
         case 2:
             print("[SIGINT=2] exit(1)", file=sys.stderr)

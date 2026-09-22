@@ -11,8 +11,9 @@ from ._src.common import (
     DownstreamTCPNode,
     DownstreamUDPNode,
     ExitNode,
-    MuxTCPUDPNode,
+    MuxNode,
     UpstreamTCPNode,
     UpstreamUDPNode,
 )
-from ._src.sdk import ProxyEdge, ProxyEdgeEnd, ProxyGraph, ProxyNode
+from ._src.dns import DNSMiddlewareNode, queryDNS, resolveDNS
+from ._src.sdk import Edge, EdgeEnd, Graph, Node
