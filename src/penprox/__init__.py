@@ -15,5 +15,5 @@ from ._src.common import (
     UpstreamTCPNode,
     UpstreamUDPNode,
 )
-from ._src.dns import DNSMiddlewareNode, queryDNS, resolveDNS
+from ._src.dns import DNSMiddlewareNode
 from ._src.sdk import Edge, EdgeEnd, Graph, Node

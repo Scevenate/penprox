@@ -192,7 +192,7 @@ class SOCKS5ClientNode(Node):
         server: IPv4Address | IPv6Address | str | tuple[
             IPv4Address | IPv6Address | str, int
         ],
-        /,
+        *args,
         boundary: bool=False
     ):
         super().__init__(boundary)

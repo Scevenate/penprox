@@ -1,4 +1,3 @@
-import aiodns
 import dnslib
 
 from ..sdk import *
@@ -17,66 +16,48 @@ def waitDNS(host: str) -> IPv4Address | IPv6Address:
                 return IPv6Address(addr[4][0])
     raise socket.gaierror(f"Domain {host} DNS lookup did not return any address")
 
-dnsResolver: aiodns.DNSResolver | None = None
-
-async def queryDNS(domain: str) -> IPv4Address | IPv6Address | None:
+@id_hash
+@dataclass(eq=False, slots=True)
+class DNSQuery:
     """
-    DNS lookup by async runtime local DNS server.
+    An active query process responsible for returning a final answer to its
+    upstreamQueries.
     """
-    global dnsResolver
-    loop = asyncio.get_running_loop()
-    if dnsResolver is None or dnsResolver.loop is not loop:
-        dnsResolver = aiodns.DNSResolver(loop=loop)
-    ipv4 = dnsResolver.getaddrinfo(domain, socket.AF_INET)
-    ipv6 = dnsResolver.getaddrinfo(domain, socket.AF_INET6)
-    pending = (ipv4, ipv6)
-    try:
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                result = task.result()
-                if task is ipv4 and result.nodes:
-                    return IPv4Address(result.nodes[0].addr[0].decode())
-                elif result.nodes:
-                    return IPv6Address(result.nodes[0].addr[0].decode())
-    except aiodns.error.DNSError:
-        pass
-
-async def resolveDNS(bound: TCPSession | UDPSession) -> bool:
-    """
-    Idempotently resolve `TCPSession` / `UDPSession` by async runtime
-    local DNS server.
-
-    Returns `False` if failed.
-    """
-    if not isinstance(bound.host, str):
-        return True
-    answer = await queryDNS(bound.host)
-    # Async resolve race
-    if isinstance(bound.host, str):
-        if not answer:
-            return False
-        bound.host = answer
-    return True
+    # Upstream queries to resolve when process returned (domain, count)
+    upstreamQueries: dict[str, int]
+    # Current querying domain (subject to CNAME)
+    downstreamQuery: str
+    # Response counter for v4+v6 query + first return None
+    tried: bool
+    def add(self, query: "DNSQuery"):
+        """
+        Move the upstream queries in the given query to this one.
+        """
+        for upstreamQuery, count in query.upstreamQueries.items():
+            if upstreamQuery in self.upstreamQueries:
+                self.upstreamQueries[upstreamQuery] += count
+            else:
+                self.upstreamQueries[upstreamQuery] = count
+        query.upstreamQueries = {}
 
 class DNSInterface:
     """
     Async DNS interface with LRUTTL cache. Wrapper of resolver downstream.
-    Only parses A records for now.
 
     Takes one interface upstream and one resolver downstream.
     
     Interface upstream consumes `str` domain name queries | `None` shut down
-    control signal, produces `(str, IPv4Address | IPv6Address | None)` result
-    | `None` malformed result. To prevent async races, the interface always
-    returns one answer for one query. Upstream should aggregate queries
-    on its own.
+    control signal, produces `(str, IPv4Address | IPv6Address | None)` result.
+    To prevent async races, the interface always returns one answer for one query.
+    Upstream should aggregate queries on its own.
 
     Downstream is standard `UDPPacket` resolver downstream edge.
     """
+    __sentinel = object()
     __slots__ = (
+        "_connection",
         "_downstream",
-        "_resolver",
+        "_mode",
         "_running",
         "_size",
         "_ttl",
@@ -87,6 +68,7 @@ class DNSInterface:
         upstream: EdgeEnd,
         downstream: EdgeEnd,
         resolver: tuple[IPv4Address | IPv6Address, int],
+        mode: Literal["v4v6", "v4", "v6"],
         size: int = 5000,
         ttl: float = 300
     ):
@@ -94,10 +76,28 @@ class DNSInterface:
         assert ttl > 0
         self._upstream: EdgeEnd = upstream
         self._downstream: EdgeEnd = downstream
-        self._resolver: tuple[IPv4Address | IPv6Address, int] = resolver
+        self._mode: Literal["v4v6", "v4", "v6"] = mode  # noqa: UP037
         self._size: int = size
         self._ttl: float = ttl
         self._running: bool = False
+        # One instance one downstream connection. Will be reused.
+        # Connection is active iff queries to fit in SIGTERM semantic
+        self._connection = UDPConnection(*resolver)
+
+    def _query(self, domain: str):
+        """
+        Query downstream a domain.
+        """
+        if self._mode != "v6":
+            self._downstream[1].put_nowait(UDPPacket(
+                self._connection,
+                bytes(dnslib.DNSRecord.question(domain, "A").pack())
+            ))
+        if self._mode != "v4":
+            self._downstream[1].put_nowait(UDPPacket(
+                self._connection,
+                bytes(dnslib.DNSRecord.question(domain, "AAAA").pack())
+            ))
 
     async def run(self):
         """
@@ -105,15 +105,17 @@ class DNSInterface:
         """
         if self._running:
             raise RuntimeError("DNS Interface is already running")
-        cache: LRUTTLDict[str, IPv4Address | IPv6Address] = LRUTTLDict(self._size, self._ttl)
-        # Will reuse this connection
-        # Connection is active iff queries to fit in SIGTERM semantic
-        connection = UDPConnection(*self._resolver)
-        queries: int = 0
+        self._running = True
+        drain(None, [self._upstream, self._downstream])
+        cache: LRUTTLDict[str, IPv4Address | IPv6Address | None] = LRUTTLDict(self._size, self._ttl)
+        
+        # Upstream & downstream DNS query lookup
+        upstreamQueries: dict[str, DNSQuery] = {}
+        downstreamQueries: dict[str, DNSQuery] = {}
         upstream = create_task(self._upstream[0].get())
         downstream = create_task(self._downstream[0].get())
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 (upstream, downstream),
                 return_when=asyncio.FIRST_COMPLETED
             )
@@ -121,68 +123,123 @@ class DNSInterface:
                 match task:
                     case _ if task is upstream:
                         upstream = create_task(self._upstream[0].get())
-                        host = cast(str | None, task.result())
-                        if host is None:
+                        domain = cast(str | None, task.result())
+                        if domain is None:
                             logger.debug("DNSInterface: Received shut down signal, quitting")
-                            if queries:
+                            if downstreamQueries:
                                 self._downstream[1].put_nowait(UDPPacket(
-                                    connection,
+                                    self._connection,
                                     "FIN"
                                 ))
                             self._running = False
+                            cancel(pending)
                             return
-                        record = cache.get(host)
-                        if record:
-                            self._upstream[1].put_nowait((host, record))
+                        record = cache.get(domain, DNSInterface.__sentinel)
+                        if record is not DNSInterface.__sentinel:
+                            self._upstream[1].put_nowait((domain, record))
                             continue
-                        if not queries:
+                        if not downstreamQueries:
                             self._downstream[1].put_nowait(UDPPacket(
-                                connection,
+                                self._connection,
                                 "SYN"
                             ))
-                        queries += 1
-                        qA = dnslib.DNSRecord.question(host, "A").pack()
-                        self._downstream[1].put_nowait(UDPPacket(
-                            connection,
-                            bytes(qA)
-                        ))
+                        if domain in upstreamQueries:
+                            upstreamQueries[domain].upstreamQueries[domain] += 1
+                        else:
+                            query = DNSQuery({domain: 1}, domain, False)
+                            upstreamQueries[domain] = query
+                            downstreamQueries[domain] = query
+                            self._query(domain)
                         continue
                     case _: # downstream
                         downstream = create_task(self._downstream[0].get())
                         packet = cast(UDPPacket, task.result())
                         if packet.payload == "SYN": # Never
-                            logger.error("DNSInterface: Resolver downstream sent SYN?")
+                            logger.error("DNSInterface: Resolver downstream sent SYN")
                             continue
                         if packet.payload == "FIN":
-                            queries = 0
+                            # Somehow. Anyway will clean up remaining queries.
+                            # Use downstream because it's 1 to 1
+                            for query in downstreamQueries.values():
+                                for domain, count in query.upstreamQueries.items():
+                                    for _ in range(count):
+                                        self._upstream[1].put_nowait((domain, None))
+                            upstreamQueries = {}
+                            downstreamQueries = {}
                             continue
-                        queries -= 1
-                        if not queries:
-                            self._downstream[1].put_nowait(UDPPacket(
-                                connection,
-                                "FIN"
-                            ))
                         try:
                             record = dnslib.DNSRecord.parse(packet.payload)
-                        except Exception as e:  # noqa: BLE001
-                            # This is an ERROR for two reasons:
-                            # 1) This is really bad, because we don't know which query is fucked,
-                            #    so upstream will wait till timeout or permanently connections
-                            #    as "resolving".
-                            # 2) We trust DNS resolver because we have no choice.
-                            logger.error(f"DNSInterface: Resolver sent invalid reply: {e}")
-                            self._upstream[1].put_nowait(None)
+                        except dnslib.DNSError:
+                            # We don't know which query failed so we'll just reset
+                            self._downstream[1].put_nowait(UDPPacket(self._connection, "FIN"))
+                            for query in downstreamQueries.values():
+                                for domain, count in query.upstreamQueries.items():
+                                    for _ in range(count):
+                                        self._upstream[1].put_nowait((domain, None))
+                            upstreamQueries = {}
+                            downstreamQueries = {}
                             continue
-                        if not record.rr:
-                            self._upstream[1].put_nowait((str(record.q.qname)[:-1], None))
+                        question = record.questions[0]
+                        domain = str(question.qname)[:-1]
+                        query = downstreamQueries.get(domain)
+                        if not query: # Late packet in resolved v4+v6 race
                             continue
-                        rr = record.a
-                        domain = str(rr.rname)[:-1]
-                        if rr.rtype != 1: # IPv4
-                            self._upstream[1].put_nowait((str(record.q.qname)[:-1], None))
-                        address = IPv4Address(rr.rdata)
-                        cache.set(domain, address)
-                        self._upstream[1].put_nowait((domain, address))
+                        if not record.rr: # Empty answer
+                            if self._mode == "v4v6" and query.tried == False:
+                                query.tried = True
+                                continue
+                            del downstreamQueries[domain]
+                            answer = None
+                        else:
+                            response = record.rr[0]
+                            del downstreamQueries[domain]
+                            if question.qtype == 1: # v4 query
+                                if response.rtype == 1: # v4 answer
+                                    answer = IPv4Address(response.rdata)
+                                elif response.rtype == 5: # CNAME answer
+                                    cdomain = str(response.rdata)[:-1]
+                                    cquery = downstreamQueries.get(cdomain)
+                                    if cquery:
+                                        for upstreamQuery in query.upstreamQueries:
+                                            upstreamQueries[upstreamQuery] = cquery
+                                        cquery.add(query)
+                                    else:
+                                        downstreamQueries[cdomain] = query
+                                        if cdomain not in query.upstreamQueries:
+                                            query.upstreamQueries[cdomain] = 0 # So upstream can safely add queries
+                                        query.downstreamQuery = cdomain
+                                        self._query(cdomain)
+                                    continue
+                                else: # Other answer, clean up
+                                    answer = None
+                            elif question.qtype == 28: # v6 query
+                                if response.rtype == 28: # v6 answer
+                                    answer = IPv6Address(response.rdata)
+                                elif response.rtype == 5: # CNAME answer
+                                    cdomain = str(response.rdata)[:-1]
+                                    cquery = downstreamQueries.get(cdomain)
+                                    if cquery:
+                                        for upstreamQuery in query.upstreamQueries:
+                                            upstreamQueries[upstreamQuery] = cquery
+                                        cquery.add(query)
+                                    else:
+                                        downstreamQueries[cdomain] = query
+                                        if cdomain not in query.upstreamQueries:
+                                            query.upstreamQueries[cdomain] = 0 # So upstream can safely add queries
+                                        query.downstreamQuery = cdomain
+                                        self._query(cdomain)
+                                    continue
+                                else: # Other answer, clean up
+                                    answer = None
+                            else: # Other query???, clean up
+                                answer = None
+                        for upstreamQuery, count in query.upstreamQueries.items():
+                            cache.set(upstreamQuery, answer)
+                            for _ in range(count):
+                                self._upstream[1].put_nowait((upstreamQuery, answer))
+                            upstreamQueries.pop(upstreamQuery, None)
+                        if not downstreamQueries:
+                            self._downstream[1].put_nowait(UDPPacket(self._connection, "FIN"))
                         continue
 
 class DNSMiddlewareNode(BaseNode):
@@ -202,6 +259,7 @@ class DNSMiddlewareNode(BaseNode):
         "_boundary",
         "_controller",
         "_edges",
+        "_mode",
         "_resolver",
         "_running",
     )
@@ -210,7 +268,8 @@ class DNSMiddlewareNode(BaseNode):
             resolver: IPv4Address | IPv6Address | str | tuple[
                 IPv4Address | IPv6Address | str, int
             ] = IPv4Address("1.1.1.1"),  # noqa: B008
-            /,
+            mode: Literal["v4v6", "v4", "v6"] = "v4",
+            *args,
             boundary: bool = False
         ) -> None:
         if not isinstance(resolver, tuple):
@@ -220,6 +279,7 @@ class DNSMiddlewareNode(BaseNode):
         self._resolver: tuple[IPv4Address | IPv6Address, int] = cast(
             tuple[IPv4Address | IPv6Address, int], resolver
         )
+        self._mode: Literal["v4v6", "v4", "v6"] = mode  # noqa: UP037
         self._boundary: bool = boundary
         self._edges: list[EdgeEnd | None] = [None, None, None]
         self._controller: Queue[Signal] = Queue()
@@ -241,8 +301,7 @@ class DNSMiddlewareNode(BaseNode):
             raise RuntimeError("Attempted to run a running DNSMiddlewareNode")
         if len(self._edges) != 3 or not all(self._edges):
             raise ValueError("Running improperly connected DNSMiddlewareNode")
-        while not self._controller.empty():
-            self._controller.get_nowait()
+        drain(self._controller, self._edges)
         self._running = True
         logger.info("Running DNSMiddlewareNode...")
 
@@ -253,15 +312,14 @@ class DNSMiddlewareNode(BaseNode):
         # Current outreaching DNS queries
         resolving: dict[str, list[TCPSession | UDPSession]] = {}
         signal: Signal | None = None
-        while not self._controller.empty():
-            self._controller.get_nowait()
 
         # Resolver downstream wrapper
         interfaceEdge = Edge()
         interface = DNSInterface(
             interfaceEdge[1],
             self._edges[2], # pyright: ignore[reportArgumentType]
-            self._resolver
+            self._resolver,
+            self._mode
         )
         create_task(interface.run())
 
@@ -270,7 +328,7 @@ class DNSMiddlewareNode(BaseNode):
         downstream = create_task(self._edges[1][0].get()) # pyright: ignore[reportOptionalSubscript]
         resolver = create_task(interfaceEdge[0][0].get())
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 (controller, upstream, downstream, resolver),
                 return_when=asyncio.FIRST_COMPLETED
             )
@@ -310,6 +368,7 @@ class DNSMiddlewareNode(BaseNode):
                                 logger.info("DNSMiddlewareNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 interfaceEdge[0][1].put_nowait(None)
+                                cancel(pending)
                                 return
                         continue
                     case _ if task is downstream:
@@ -322,6 +381,7 @@ class DNSMiddlewareNode(BaseNode):
                                 logger.info("DNSMiddlewareNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 interfaceEdge[0][1].put_nowait(None)
+                                cancel(pending)
                                 return
                         continue
                     case _ if task is resolver:
@@ -344,6 +404,7 @@ class DNSMiddlewareNode(BaseNode):
                                 logger.info("DNSMiddlewareNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 interfaceEdge[0][1].put_nowait(None)
+                                cancel(pending)
                                 return
                             continue
                         logger.debug(f"DNSMiddlewareNode: Host {result[0]} resolved into {result[1]!s}, releasing blocked sessions")
@@ -361,19 +422,14 @@ class DNSMiddlewareNode(BaseNode):
                         if _signal == "SIGKILL":
                             self._running = False
                             interfaceEdge[0][1].put_nowait(None)
+                            cancel(pending)
                             return
                         if _signal == "SIGTERM":
                             if not pool:
                                 logger.info("DNSMiddlewareNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
                                 interfaceEdge[0][1].put_nowait(None)
+                                cancel(pending)
                                 return
                             signal = "SIGTERM"
                         continue
-
-                        
-                        
-                            
-
-
-

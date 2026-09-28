@@ -6,12 +6,12 @@ Underlying structures used by penprox.
 
 from ._src.dns import (
     DNSInterface,
-    dnsResolver,
     waitDNS,
 )
 from ._src.sdk import (
     Bidict,
     LRUTTLDict,
+    RunningGraphs,
     Signal,
     TCPConnection,
     TCPMessage,
@@ -21,6 +21,5 @@ from ._src.sdk import (
     UDPMessage,
     UDPPacket,
     UDPSession,
-    RunningGraphs,
     running_graphs,
 )

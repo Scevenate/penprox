@@ -29,7 +29,7 @@ class UpstreamTCPNode(BaseNode):
     def __init__(
         self,
         address: int | tuple[IPv4Address | IPv6Address, int],
-        /,
+        *args,
         boundary: bool = True
     ) -> None:
         self._controller: Queue[Signal] = Queue()
@@ -62,6 +62,8 @@ class UpstreamTCPNode(BaseNode):
         )
         def __init__(self, node: UpstreamTCPNode):
             self._node: UpstreamTCPNode = node
+            # The connection may be lost before made
+            self._connection: TCPConnection | None = None
         def connection_made( # pyright: ignore[reportIncompatibleMethodOverride]
             self,
             transport: asyncio.Transport
@@ -79,17 +81,21 @@ class UpstreamTCPNode(BaseNode):
             else: # v6
                 connection = TCPConnection(IPv6Address(peerName[0]), peerName[1])
             logger.debug(f"UpstreamTCPNode: New connection {connection}")
-            self._connection: TCPConnection = connection
+            self._connection = connection
             self._node._connections[connection] = transport
             self._node._open(0, connection)
         def data_received(self, data: bytes) -> None:
-            self._node._send(0, self._connection, data) 
+            connection = cast(TCPConnection, self._connection)
+            self._node._send(0, connection, data) 
         def connection_lost(self, exc: Exception | None) -> None:
             if exc:
                 logger.error(f"UpstreamTCPNode: Received {exc} when closing connection")
-            logger.debug(f"UpstreamTCPNode: Connection closed {self._connection}")
-            if self._node._connections.pop(self._connection, None):
-                self._node._close(0, self._connection)
+            connection = self._connection
+            if connection is None:
+                return
+            logger.debug(f"UpstreamTCPNode: Connection closed {connection}")
+            if self._node._connections.pop(connection, None):
+                self._node._close(0, connection)
             if self._node._signal == "SIGTERM" and not self._node._connections:
                 self._node._controller.put_nowait("SIGKILL")
 
@@ -119,8 +125,7 @@ class UpstreamTCPNode(BaseNode):
             raise RuntimeError("Attempted to run a running UpstreamTCPNode")
         if len(self._edges) != 1 or not self._edges[0]:
             raise ValueError("Running improperly connected UpstreamTCPNode")
-        while not self._controller.empty():
-            self._controller.get_nowait()
+        drain(self._controller, self._edges)
         self._connections: dict[TCPConnection, asyncio.Transport] = {}
         self._signal: Signal | None = None
         logger.info("Running UpstreamTCPNode...")
@@ -148,22 +153,20 @@ class UpstreamTCPNode(BaseNode):
         dispatcher = create_task(self._dispatch())
         controller = create_task(self._controller.get())
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 (server, dispatcher, controller),
                 return_when=asyncio.FIRST_COMPLETED
             )
             if server in done or dispatcher in done:
-                server.cancel()
-                dispatcher.cancel()
                 self._running = False
+                cancel(pending)
                 return None if self._signal else "SIGKILL"
             signal = cast(Signal, done.pop().result())
             logger.info(f"UpstreamTCPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
-                server.cancel()
-                dispatcher.cancel()
                 self._running = False
+                cancel(pending)
                 logger.info("UpstreamTCPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
@@ -197,7 +200,7 @@ class UpstreamUDPNode(BaseNode):
     def __init__(
         self,
         address: int | tuple[IPv4Address | IPv6Address, int],
-        /,
+        *args,
         boundary: bool = True
     ) -> None:
         self._controller: Queue[Signal] = Queue()
@@ -281,8 +284,7 @@ class UpstreamUDPNode(BaseNode):
             raise ValueError("Running improperly connected UpstreamUDPNode")
         self._connections: dict[tuple[IPv4Address | IPv6Address, int], UDPConnection] = {}
         self._signal: Signal | None = None
-        while not self._controller.empty():
-            self._controller.get_nowait()
+        drain(self._controller, self._edges)
         logger.info("Running UpstreamUDPNode...")
         self._running = True
 
@@ -307,19 +309,20 @@ class UpstreamUDPNode(BaseNode):
         dispatcher = create_task(self._dispatch())
         controller = create_task(self._controller.get())
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 (dispatcher, controller),
                 return_when=asyncio.FIRST_COMPLETED
             )
             if dispatcher in done:
                 self._transport.close()
                 self._running = False
+                cancel(pending)
                 return None if self._signal else "SIGKILL"
             signal = cast(Signal, done.pop().result())
             logger.info(f"UpstreamUDPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
-                dispatcher.cancel()
+                cancel(pending)
                 self._transport.close()
                 self._running = False
                 logger.info("UpstreamUDPNode: Quitting (SIGTERM / SIGKILL)")
@@ -342,7 +345,7 @@ class DownstreamTCPNode(BaseNode):
         "_running",
         "_signal",
     )
-    def __init__(self, /, boundary: bool = False) -> None:
+    def __init__(self, *args, boundary: bool = False) -> None:
         self._controller: Queue[Signal] = Queue()
         self._edges: list[EdgeEnd | None] = [None]
         self._running: bool = False
@@ -409,7 +412,7 @@ class DownstreamTCPNode(BaseNode):
                             packet.bound.port
                         )
                     except OSError as e:
-                        logger.error(f"DownstreamTCPNode: Received {e.strerror} while constructing connection")
+                        logger.error(f"DownstreamTCPNode: Received {e.strerror} while constructing connection to {packet.bound.host}")
                         self._reject(0, packet)
                     continue
                 transport: asyncio.Transport | None = self._connections.get(packet.bound)
@@ -432,20 +435,20 @@ class DownstreamTCPNode(BaseNode):
             raise ValueError("Running improperly connected DownstreamTCPNode")
         self._connections: dict[TCPConnection, asyncio.Transport] = {}
         self._signal: Signal | None = None
-        while not self._controller.empty():
-            self._controller.get_nowait()
+        drain(self._controller, self._edges)
         logger.info("Running DownstreamTCPNode...")
         self._running = True
 
         dispatcher = create_task(self._dispatch())
         controller = create_task(self._controller.get())
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 (dispatcher, controller),
                 return_when=asyncio.FIRST_COMPLETED
             )
             if dispatcher in done:
                 self._running = False
+                cancel(pending)
                 return None if self._signal else "SIGKILL"
             signal = cast(Signal, done.pop().result())
             logger.info(f"DownstreamTCPNode: Received {signal} signal")
@@ -453,8 +456,8 @@ class DownstreamTCPNode(BaseNode):
                 signal == "SIGTERM" and not self._connections:
                 for transport in self._connections.values():
                     transport.close()
-                dispatcher.cancel()
                 self._running = False
+                cancel(pending)
                 logger.info("DownstreamTCPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
@@ -475,7 +478,7 @@ class DownstreamUDPNode(BaseNode):
         "_signal",
         "_transport",
     )
-    def __init__(self, /, boundary: bool = False) -> None:
+    def __init__(self, *args, boundary: bool = False) -> None:
         self._controller: Queue[Signal] = Queue()
         self._edges: list[EdgeEnd | None] = [None]
         self._running: bool = False
@@ -545,8 +548,7 @@ class DownstreamUDPNode(BaseNode):
             raise ValueError("Running improperly connected DownstreamUDPNode")
         self._connections: dict[tuple[IPv4Address | IPv6Address, int], UDPConnection] = {}
         self._signal: Signal | None = None
-        while not self._controller.empty():
-            self._controller.get_nowait()
+        drain(self._controller, self._edges)
         logger.info("Running DownstreamUDPNode...")
         self._running = True
 
@@ -559,22 +561,23 @@ class DownstreamUDPNode(BaseNode):
         dispatcher = create_task(self._dispatch())
         controller = create_task(self._controller.get())
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 (dispatcher, controller),
                 return_when=asyncio.FIRST_COMPLETED
             )
             if dispatcher in done:
                 self._transport.close()
                 self._running = False
+                cancel(pending)
                 return None if self._signal else "SIGKILL"
             signal = cast(Signal, done.pop().result())
             logger.info(f"DownstreamUDPNode: Received {signal} signal")
             if signal == "SIGKILL" or \
                 signal == "SIGTERM" and not self._connections:
-                dispatcher.cancel()
                 if self._transport:
                     self._transport.close()
                 self._running = False
+                cancel(pending)
                 logger.info("DownstreamUDPNode: Quitting (SIGTERM / SIGKILL)")
                 return
             self._signal = signal
@@ -627,6 +630,7 @@ class ExitNode(Node):
                 if message.payload == "FIN":
                     logger.debug(f"ExitNode: Session closed {message.bound.host}")
                     self._connections.ydiscard(connection)
+                    self._close(1, connection)
                     return
                 self._send(1, connection, message.payload)
                 return
@@ -644,6 +648,7 @@ class ExitNode(Node):
                 if packet.payload == "FIN":
                     logger.debug(f"ExitNode: Session closed {packet.bound.host}")
                     self._connections.ydiscard(packet.bound)
+                    self._close(0, session)
                     return
                 self._send(0, session, packet.payload)
 
@@ -665,7 +670,7 @@ class MuxNode(BaseNode):
         "_edges",
         "_running",
     )
-    def __init__(self, initial_size: int = 2, /, boundary: bool = False) -> None:
+    def __init__(self, initial_size: int = 2, *args, boundary: bool = False) -> None:
         assert initial_size >= 2
         self._controller: Queue[Signal] = Queue()
         self._edges: list[EdgeEnd | None] = [None] * (initial_size + 1)
@@ -694,8 +699,7 @@ class MuxNode(BaseNode):
             TCPConnection | UDPConnection | TCPSession | UDPSession, int
         ] = {}
         signal: Signal | None = None
-        while not self._controller.empty():
-            self._controller.get_nowait()
+        drain(self._controller, self._edges)
         logger.info("Running MuxNode...")
         self._running = True
 
@@ -703,7 +707,7 @@ class MuxNode(BaseNode):
         upstreams = [create_task(self._edges[i][0].get()) for i in range(len(self._edges))] # pyright: ignore[reportOptionalSubscript]
         downstream = create_task(self._edges[2][0].get()) # pyright: ignore[reportOptionalSubscript]
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 upstreams + [controller, downstream],
                 return_when=asyncio.FIRST_COMPLETED
             )
@@ -727,6 +731,7 @@ class MuxNode(BaseNode):
                             if signal == "SIGTERM" and not pool:
                                 logger.info("MuxNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
+                                cancel(pending)
                                 return
                         continue
                     case _ if task is controller:
@@ -735,11 +740,13 @@ class MuxNode(BaseNode):
                         logger.info(f"MuxNode: Received {_signal} signal")
                         if _signal == "SIGKILL":
                             self._running = False
+                            cancel(pending)
                             return
                         if _signal == "SIGTERM":
                             if not pool:
                                 logger.info("MuxNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
+                                cancel(pending)
                                 return
                             signal = "SIGTERM"
                         continue
@@ -758,6 +765,7 @@ class MuxNode(BaseNode):
                             if signal == "SIGTERM" and not pool:
                                 logger.info("MuxNode: All connection served, quitting (SIGTERM)")
                                 self._running = False
+                                cancel(pending)
                                 return
                         continue
 

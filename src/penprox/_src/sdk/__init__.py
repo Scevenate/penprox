@@ -16,6 +16,10 @@ from janus import Queue as HybridQueue
 
 logger = getLogger("penprox")
 
+def cancel(pending: set[asyncio.Future] | set[asyncio.Task] | set[asyncio.Future | asyncio.Task]):
+    for task in pending:
+        task.cancel()
+
 class RunningGraphs:
     __slots__ = (
         "_lock",
@@ -314,6 +318,17 @@ def Edge() -> tuple[EdgeEnd, EdgeEnd]:
         (q2, q1)
     )
 
+def drain(controller: Queue | None, edges: list[EdgeEnd | None]):
+    if controller:
+        while not controller.empty():
+            controller.get_nowait()
+    for edge in edges:
+        if not edge:
+            continue
+        consumer = edge[0]
+        while not consumer.empty():
+            consumer.get_nowait()
+
 class BaseNode(ABC):
     """
     ABC for all nodes.
@@ -392,18 +407,6 @@ class BaseNode(ABC):
             self.edges()[edge][1].put_nowait(UDPPacket(obj, "SYN")) # pyright: ignore[reportOptionalSubscript]
         else:
             self.edges()[edge][1].put_nowait(UDPMessage(obj, "SYN")) # pyright: ignore[reportOptionalSubscript]
-    def _send(self, edge: int, obj: TCPConnection | UDPConnection | TCPSession | UDPSession, data: bytes):
-        """
-        Helper method for sending data bound to a connection or session.
-        """
-        if isinstance(obj, TCPConnection):
-            self.edges()[edge][1].put_nowait(TCPPacket(obj, data)) # pyright: ignore[reportOptionalSubscript]
-        elif isinstance(obj, TCPSession):
-            self.edges()[edge][1].put_nowait(TCPMessage(obj, data)) # pyright: ignore[reportOptionalSubscript]
-        elif isinstance(obj, UDPConnection):
-            self.edges()[edge][1].put_nowait(UDPPacket(obj, data)) # pyright: ignore[reportOptionalSubscript]
-        else:
-            self.edges()[edge][1].put_nowait(UDPMessage(obj, data)) # pyright: ignore[reportOptionalSubscript]
     def _close(self, edge: int, obj: TCPConnection | UDPConnection | TCPSession | UDPSession):
         """
         Helper method for pushing a FIN for a closing connection or session.
@@ -433,6 +436,18 @@ class BaseNode(ABC):
         Forward a packet.
         """
         self.edges()[edge][1].put_nowait(obj) # pyright: ignore[reportOptionalSubscript]
+    def _send(self, edge: int, obj: TCPConnection | UDPConnection | TCPSession | UDPSession, data: bytes):
+        """
+        Helper method for sending data bound to a connection or session.
+        """
+        if isinstance(obj, TCPConnection):
+            self.edges()[edge][1].put_nowait(TCPPacket(obj, data)) # pyright: ignore[reportOptionalSubscript]
+        elif isinstance(obj, TCPSession):
+            self.edges()[edge][1].put_nowait(TCPMessage(obj, data)) # pyright: ignore[reportOptionalSubscript]
+        elif isinstance(obj, UDPConnection):
+            self.edges()[edge][1].put_nowait(UDPPacket(obj, data)) # pyright: ignore[reportOptionalSubscript]
+        else:
+            self.edges()[edge][1].put_nowait(UDPMessage(obj, data)) # pyright: ignore[reportOptionalSubscript]
     def __add__(self, other: BaseNode | Graph) -> Graph:
         """
         Syntactic sugar for putting nodes into graphs.
@@ -495,15 +510,15 @@ class Graph:
     Also async runtime manager, and used for connecting nodes.
     """
     __slots__ = (
-        "__controller",
-        "__nodes",
-        "__running"
+        "_controller",
+        "_nodes",
+        "_running"
     )
     __sentinel = object()
     def __init__(self, *nodes: BaseNode):
-        self.__nodes: list[BaseNode] = list(nodes)
-        self.__running: bool = False
-        self.__controller: HybridQueue[Signal] = HybridQueue()
+        self._nodes: list[BaseNode] = list(nodes)
+        self._running: bool = False
+        self._controller: HybridQueue[Signal] = HybridQueue()
 
     def nodes(self) -> list[BaseNode]:
         """
@@ -511,26 +526,26 @@ class Graph:
 
         Unless otherwise documented, do not mutate while running.
         """
-        return self.__nodes
+        return self._nodes
     def running(self) -> bool:
         """
         Returns `True` iff the graph is running.
 
         A running graph is considered immutable unless explicitly documented.
         """
-        return self.__running
+        return self._running
     def controller(self) -> HybridQueue[Signal]:
         """
         Get controller end of graph. Supports both async / sync mpsc pushing.
 
         Use to broadcast control signal to ALL nodes in the graph.
         """
-        return self.__controller
+        return self._controller
     def __del__(self):
         """
         Controller queue lifetime manager.
         """
-        self.__controller.shutdown()
+        self._controller.shutdown()
     def __add__(self, other: BaseNode | Graph) -> Graph:
         
         """
@@ -543,11 +558,11 @@ class Graph:
         if self.running() or other.running():
             raise RuntimeError("Cannot add while running")
         if isinstance(other, BaseNode):
-            self.__nodes.append(other)
+            self._nodes.append(other)
             return self
         if not self.controller().sync_q.empty() or not other.controller().sync_q.empty():
             raise ValueError("Cannot add graphs with queued control signals")
-        self.__nodes += other.__nodes
+        self._nodes += other._nodes
         return self
 
     def __rshift__(self, other: BaseNode | Graph):
@@ -604,17 +619,17 @@ class Graph:
 
         Raises `RuntimeError` instead if anything is already running.
         """
-        if self.__running or any(node.running() for node in self.__nodes):
+        if self._running or any(node.running() for node in self._nodes):
             raise RuntimeError("Something is already running")
-        self.__running = True
+        self._running = True
         running_graphs.add(self)
-        while not self.__controller.sync_q.empty():
-            self.__controller.sync_q.get_nowait()
+        while not self._controller.sync_q.empty():
+            self._controller.sync_q.get_nowait()
 
         taskTrace: dict[asyncio.Task, BaseNode | Literal["controller"]] = {}
-        for node in self.__nodes:
+        for node in self._nodes:
             taskTrace[create_task(node.run())] = node
-        taskTrace[create_task(self.__controller.async_q.get())] = "controller"
+        taskTrace[create_task(self._controller.async_q.get())] = "controller"
         while True:
             done, _ = await asyncio.wait(taskTrace.keys(), return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -636,7 +651,7 @@ class Graph:
                     logger.info(f"Graph: Received control signal {result}, broadcasting")
                     for node in taskTrace.values():
                         cast(BaseNode, node).controller().put_nowait(result)
-                    taskTrace[create_task(self.__controller.async_q.get())] = "controller"
+                    taskTrace[create_task(self._controller.async_q.get())] = "controller"
                     continue
                 else:
                     node = taskTrace.pop(task)
@@ -646,8 +661,9 @@ class Graph:
                             node.controller().put_nowait(result)
                     continue
             if len(taskTrace) == 1 and next(iter(taskTrace.values())) == "controller":
+                next(iter(taskTrace)).cancel()
                 break
-        self.__running = False
+        self._running = False
         running_graphs.remove(self)
         logger.info("Graph: All finished, quitting")
 
@@ -666,22 +682,26 @@ class Node(BaseNode, ABC):
     - `run` callback: `async def _run(self)`
     - `__init__`: Implementor must still call `super().__init__(self, boundary)`.
 
-    The `_onGet` or `_run` callback may return a signal or raise an error. It will propagate transparently.
+    Implementor should use provided helper methods (e.g. `_open`, `_close`, `_reject`) to open / close connections / sessions.
+
+    The `_onGet` or `_run` callback may return a signal or raise an error. This will terminate the node and propagate.
     """
     __slots__ = (
         "__boundary",
         "__controller",
         "__edges",
+        "__pool",
         "__running"
     )
     _edges: int
     _upstreams: tuple[int, ...]
     _downstreams: tuple[int, ...]
-    def __init__(self, /, boundary: bool = False):
+    def __init__(self, *args, boundary: bool = False):
         self.__boundary: bool = boundary
         self.__controller: Queue[Signal] = Queue()
         self.__edges: list[EdgeEnd | None] = [None] * self.__class__._edges
         self.__running: bool = False
+        self.__pool: set[TCPConnection | UDPConnection | TCPSession | UDPSession] = set()
     def boundary(self) -> bool:
         return self.__boundary
     def controller(self) -> Queue[Signal]:
@@ -694,6 +714,15 @@ class Node(BaseNode, ABC):
         return self.__class__._upstreams
     def downstreams(self) -> tuple[int, ...]:
         return self.__class__._downstreams
+    def _open(self, edge: int, obj: TCPConnection | UDPConnection | TCPSession | UDPSession):
+        self.__pool.add(obj)
+        super()._open(edge, obj)
+    def _close(self, edge: int, obj: TCPConnection | UDPConnection | TCPSession | UDPSession):
+        self.__pool.discard(obj)
+        super()._close(edge, obj)
+    def _reject(self, edge: int, obj: TCPPacket | UDPPacket | TCPMessage | UDPMessage):
+        self.__pool.discard(obj)
+        super()._reject(edge, obj)
     async def run(self) -> Signal | None:
         if self.__running:
             raise RuntimeError("Node is already running")
@@ -702,18 +731,17 @@ class Node(BaseNode, ABC):
         signal = await self._run()
         if signal:
             return signal
-        while not self.__controller.empty():
-            self.__controller.get_nowait()
+        drain(self.__controller, self.__edges)
         logger.info(f"{self.__class__.__name__} is running...")
         self.__running = True
 
-        pool: set[TCPConnection | UDPConnection | TCPSession | UDPSession] = set()
+        self.__pool: set[TCPConnection | UDPConnection | TCPSession | UDPSession] = set()
         signal: Signal | None = None
 
         controller = create_task(self.__controller.get())
         edges = [create_task(edge[0].get()) for edge in self.__edges] # pyright: ignore[reportOptionalSubscript]
         while True:
-            done, _ = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 edges + [controller],
                 return_when=asyncio.FIRST_COMPLETED
             )
@@ -725,11 +753,13 @@ class Node(BaseNode, ABC):
                     if _signal == "SIGKILL":
                         logger.info(f"{self.__class__.__name__}: Killed")
                         self.__running = False
+                        cancel(pending)
                         return
                     if _signal == "SIGTERM":
-                        if not pool:
+                        if not self.__pool:
                             logger.info(f"{self.__class__.__name__}: All connection served, quitting (SIGTERM)")
                             self.__running = False
+                            cancel(pending)
                             return
                         signal = "SIGTERM"
                     continue
@@ -738,23 +768,25 @@ class Node(BaseNode, ABC):
                 obj = cast(TCPPacket | UDPPacket | TCPMessage | UDPMessage, task.result())
                 if obj.payload == "SYN":
                     if signal == "SIGTERM":
-                        self._reject(edge, obj)
+                        super()._reject(edge, obj)
                         continue
-                    pool.add(obj.bound)
+                    self.__pool.add(obj.bound)
                 try:
                     _signal = await self._onGet(edge, obj)
                     if _signal:
                         self.__running = False
+                        cancel(pending)
                         return _signal
                 except Exception as e:
                     self.__running = False
                     raise e  # noqa: TRY201
                 if obj.payload == "FIN":
-                    pool.discard(obj.bound)
-                    if signal == "SIGTERM" and not pool:
-                        logger.info(f"{self.__class__.__name__}: All connection served, quitting (SIGTERM)")
-                        self.__running = False
-                        return
+                    self.__pool.discard(obj.bound)
+                if signal == "SIGTERM" and not self.__pool:
+                    logger.info(f"{self.__class__.__name__}: All connection served, quitting (SIGTERM)")
+                    self.__running = False
+                    cancel(pending)
+                    return
     async def _run(self) -> Signal | None:
         return
     @abstractmethod
