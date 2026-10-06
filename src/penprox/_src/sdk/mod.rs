@@ -1,26 +1,57 @@
 #[pyo3::pymodule]
 pub mod sdk {
-    use std::{hash::{Hash, Hasher}, net::IpAddr, sync::{Arc, OnceLock, Mutex as MutexStd}, future::Future, pin::Pin};
+    use std::{hash::{Hash, Hasher}, net::IpAddr, sync::{Arc, OnceLock, Mutex as MutexStd}};
     use async_trait::async_trait;
-    use pyo3::{Borrowed, FromPyObject, IntoPyObject, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyList, PyString}};
+    use pyo3::{Borrowed, FromPyObject, IntoPyObject, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
     use tokio::{sync::{Mutex as MutexTokio, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::JoinSet};
-    use futures::future::select_all;
 
-    /// Just `IPv4Address | IPv6Address | str` python type.
-    #[derive(FromPyObject, IntoPyObject)]
+    #[derive(FromPyObject, IntoPyObject, Clone)]
     pub enum Host {
         Domain(String),
         Ip(IpAddr)
+    }
+
+    #[derive(Clone, Copy)]
+    pub enum Transport {
+        TCP,
+        UDP
+    }
+
+    impl<'a, 'py> FromPyObject<'a, 'py> for Transport {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            match obj.cast::<PyString>() {
+                Ok(obj) => match obj.to_str() {
+                    Ok("TCP") => Ok(Transport::TCP),
+                    Ok("UDP") => Ok(Transport::UDP),
+                    _ => Err(PyValueError::new_err("Invalid Value"))
+                },
+                _ => Err(PyValueError::new_err("Invalid Value"))
+            }
+        }
+    }
+
+    impl<'py> IntoPyObject<'py> for Transport {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self: Self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            match self {
+                Transport::TCP => Ok(PyString::new(py, "TCP").into_any()),
+                Transport::UDP => Ok(PyString::new(py, "UDP").into_any()),
+            }
+        }
     }
 
     /// Inner data struct & memory identity of a connection.
     /// 
     /// The connection is generally immutable and has a uncopiable memory identity.
     pub struct Connection {
-        pub domain: Option<String>,
+        domain: Option<String>,
         /// This must be set if domain is None.
-        pub ip: OnceLock<IpAddr>,
-        pub port: u8
+        ip: OnceLock<IpAddr>,
+        transport: Transport,
+        port: u8
     }
 
     /// General representation of a connection.
@@ -31,42 +62,39 @@ pub mod sdk {
     impl Eq for ConnectionToken {}
     impl PartialEq for ConnectionToken {
         fn eq(&self, other: &Self) -> bool {
-            self.id() == other.id()
+            self.0.as_ref() as *const Connection as usize == other.0.as_ref() as *const Connection as usize
         }
     }
     impl Hash for ConnectionToken {
         fn hash<H: Hasher>(&self, state: &mut H) {
-            state.write_usize(self.id());
+            state.write_usize(self.0.as_ref() as *const Connection as usize);
         }
     }
 
     #[pymethods]
     impl ConnectionToken {
-        /// Get the memory identity of the connection.
-        pub fn id(&self) -> usize {
-            self.0.as_ref() as *const Connection as usize
-        }
         /// Idempotently set IP.
         pub fn resolve(&self, ip_addr: IpAddr) {
             let _ = self.0.ip.set(ip_addr);
         }
         /// Initialize new connection.
         #[new]
-        pub fn new(host: Host, port: u8) -> Self {
+        pub fn new(host: Host, transport: Transport, port: u8) -> Self {
             match host {
                 Host::Domain(domain) => Self(Arc::new(Connection {
                     domain: Some(domain),
                     ip: OnceLock::new(),
-                    port: port
+                    transport,
+                    port
                 })),
                 Host::Ip(ip_addr) => Self(Arc::new(Connection {
                     domain: None,
                     ip: OnceLock::from(ip_addr),
-                    port: port
+                    transport,
+                    port
                 }))
             }
         }
-        /// Python host getter
         #[getter]
         pub fn host(&self) -> PyResult<Host> {
             match self.0.ip.get() {
@@ -74,7 +102,10 @@ pub mod sdk {
                 None => Ok(Host::Domain(self.0.domain.clone().expect("Connection has no host")))
             }
         }
-        /// Python port getter
+        #[getter]
+        pub fn transport(&self) -> Transport {
+            self.0.transport
+        }
         #[getter]
         pub fn port(&self) -> u8 {
             self.0.port
@@ -122,7 +153,7 @@ pub mod sdk {
     }
 
     /// General representation of a packet.
-    #[pyclass(from_py_object, name="Packet")]
+    #[pyclass(from_py_object)]
     #[derive(Clone)]
     pub struct Packet {
         #[pyo3(get, set)]
@@ -151,63 +182,88 @@ pub mod sdk {
         SIGUSR2
     }
 
-    /// Signal handle.
-    #[pyclass(from_py_object, frozen)]
+    /// Inner data struct of a node end.
+    pub struct NodeEnd {
+        pub receiver: Receiver<Packet>,
+        pub sender: Sender<Packet>
+    }
+
+    /// General representation of a node end.
+    /// 
+    /// The lock is short held unless the node is running.
+    #[pyclass(from_py_object)]
     #[derive(Clone)]
-    pub struct SignalHandle(pub Sender<Signal>);
+    pub struct NodeEndToken(pub Arc<MutexStd<Option<NodeEnd>>>);
 
     #[pymethods]
-    impl SignalHandle {
-        pub fn signal(&self, signal: Signal) -> PyResult<()> {
-            match self.0.try_send(signal) {
-                Ok(()) => Ok(()),
+    impl NodeEndToken {
+        pub fn empty(&self) -> PyResult<bool> {
+            let Ok(guard) = &mut self.0.try_lock() else {
+                return PyResult::Err(PyRuntimeError::new_err("End is occupied"));
+            };
+            Ok(guard.as_ref().is_some())
+        }
+        pub fn send(&self, packet: Packet) -> PyResult<()> {
+            let Ok(guard) = &mut self.0.try_lock() else {
+                return PyResult::Err(PyRuntimeError::new_err("End is occupied"));
+            };
+            let Some(node_end) = guard.as_mut() else {
+                return PyResult::Err(PyRuntimeError::new_err("End is empty"));
+            };
+            match node_end.sender.try_send(packet) {
+                Ok(_) => Ok(()),
                 Err(err) => match err {
-                    TrySendError::Full(_) => Err(PyBufferError::new_err("Queue is full")),
-                    TrySendError::Closed(_) => Err(PyEOFError::new_err("Queue closed"))
+                    TrySendError::Closed(_) => Err(PyEOFError::new_err("End is closed")),
+                    TrySendError::Full(_) => Err(PyBufferError::new_err("End is full")) 
                 }
             }
         }
     }
 
-    pub type Upstream = Arc<MutexStd<Option<Receiver<Packet>>>>;
-    pub type Downstream = Arc<MutexStd<Option<Sender<Packet>>>>;
-
-    
-
-
     /// Basic node interface.
+    /// 
+    /// Unfortunately trait cannot be pymethods, so additional helper methods are added.
     #[async_trait]
     pub trait Node: Send {
-        fn upstreams(&mut self) -> &mut [Upstream];
-        fn downstreams(&mut self) -> &mut [Downstream];
+        fn upstreams(&self) -> Vec<NodeEndToken>;
+        fn downstreams(&self) -> Vec<NodeEndToken>;
         async fn run(&mut self) -> Result<Option<Signal>, &'static str>;
         /// Function for merging graphs
-        fn nodes(&mut self) -> Option<&mut Vec<NodeToken>> { None }
+        fn nodes(&self) -> Option<Vec<NodeToken>> { None }
+    }
+
+    #[pyfunction]
+    pub fn get_node_upstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
+        match node.node.try_lock().as_mut() {
+            Ok(node) => Ok(node.upstreams()),
+            _ => Err(PyRuntimeError::new_err("Node is running"))
+        }
+    }
+
+    #[pyfunction]
+    pub fn get_node_downstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
+        match node.node.try_lock().as_mut() {
+            Ok(node) => Ok(node.downstreams()),
+            _ => Err(PyRuntimeError::new_err("Node is running"))
+        }
+    }
+
+    #[pyfunction]
+    pub fn get_node_nodes(node: &NodeToken) -> PyResult<Option<Vec<NodeToken>>> {
+        match node.node.try_lock().as_mut() {
+            Ok(node) => Ok(node.nodes()),
+            _ => Err(PyRuntimeError::new_err("Node is running"))
+        }
     }
 
     /// General representation of a node.
     /// 
-    /// The token points to a unclonable node with memory identity.
+    /// The node lock is long held when running.
     #[pyclass(from_py_object, name="Node")] // `eq` / `hash` requires immutability so we'll custom memory id impl
     #[derive(Clone)]
     pub struct NodeToken {
-        /// It's `Some` if you can access it.
         pub node: Arc<MutexTokio<Box<dyn Node>>>,
-        /// This handle represents the node's memory identity (with runtime access).
-        #[pyo3(get)]
-        pub signal_handle: SignalHandle
-    }
-
-    impl Eq for NodeToken {}
-    impl PartialEq for NodeToken {
-        fn eq(&self, other: &Self) -> bool {
-            self.id() == other.id()
-        }
-    }
-    impl Hash for NodeToken {
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            state.write_usize(self.id());
-        }
+        pub signal_sender: Sender<Signal>
     }
 
     impl NodeToken {
@@ -220,35 +276,46 @@ pub mod sdk {
         pub fn connect(upstream_node: &mut Self, downstream_index: usize, downstream_node: &mut Self, upstream_index: usize) -> Result<(), &'static str> {
             let mut upstream_guard = upstream_node.node.try_lock().map_err(|_| "Node is running")?;
             let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
-            let upstream_node = upstream_guard.as_mut();
-            let downstream_node = downstream_guard.as_mut();
-            let (sender, receiver) = channel(64);
-            *upstream_node.downstreams()[downstream_index].lock().unwrap() = Some(sender);
-            *downstream_node.upstreams()[upstream_index].lock().unwrap() = Some(receiver);
+            let upstream_downstreams = upstream_guard.as_mut().downstreams();
+            let downstream_upstreams = downstream_guard.as_mut().upstreams();
+            let mut upstream_downstream = upstream_downstreams[downstream_index].0.try_lock().expect("Cannot lock node end");
+            let mut downstream_upstream = downstream_upstreams[upstream_index].0.lock().expect("Cannot lock node end");
+            let (sender1, receiver1) = channel(32);
+            let (sender2, receiver2) = channel(32);
+            *upstream_downstream = Some(NodeEnd {
+                sender: sender1,
+                receiver: receiver2
+            });
+            *downstream_upstream = Some(NodeEnd {
+                sender: sender2,
+                receiver: receiver1
+            });
             Ok(())
         }
         /// Connect upstream empty downstreams to downstream empty upstreams until either side is fully connected.
         pub fn connect_all(upstream_node: &mut Self, downstream_node: &mut Self) -> Result<(), &'static str> {
-            let mut upstream_guard = upstream_node.node.try_lock().map_err(|_| "Node is running")?;
-            let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
-            let upstream_node = upstream_guard.as_mut();
-            let downstream_node = downstream_guard.as_mut();
-            let downstreams = upstream_node.downstreams();
-            let mut upstreams = downstream_node.upstreams().iter();
-            for downstream in downstreams.iter() {
-                if downstream.lock().unwrap().is_some() {
-                    continue;
-                }
-                let upstream = loop {
-                    match upstreams.next() {
-                        Some(upstream) if upstream.lock().unwrap().is_none() => break upstream,
-                        Some(_) => continue,
-                        None => return Ok(())
+            let empty_downstreams = {
+                let mut upstream_guard = upstream_node.node.try_lock().map_err(|_| "Node is running")?;
+                let mut indices = Vec::new();
+                for (index, downstream) in upstream_guard.as_mut().downstreams().iter().enumerate() {
+                    if downstream.0.try_lock().map_err(|_| "Cannot lock node end")?.is_none() {
+                        indices.push(index);
                     }
-                };
-                let (sender, receiver) = channel(64);
-                *downstream.lock().unwrap() = Some(sender);
-                *upstream.lock().unwrap() = Some(receiver);
+                }
+                indices
+            };
+            let empty_upstreams = {
+                let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
+                let mut indices = Vec::new();
+                for (index, upstream) in downstream_guard.as_mut().upstreams().iter().enumerate() {
+                    if upstream.0.try_lock().map_err(|_| "Cannot lock node end")?.is_none() {
+                        indices.push(index);
+                    }
+                }
+                indices
+            };
+            for (downstream_index, upstream_index) in empty_downstreams.into_iter().zip(empty_upstreams) {
+                Self::connect(upstream_node, downstream_index, downstream_node, upstream_index)?;
             }
             Ok(())
         }
@@ -267,7 +334,7 @@ pub mod sdk {
             let mut second_guard = second.node.try_lock().map_err(|_| "Node is running")?;
             let first_node = first_guard.as_mut();
             let second_node = second_guard.as_mut();
-            match (first_node.nodes(), second_node.nodes()) {
+            match (first_node.nodes().as_mut(), second_node.nodes().as_mut()) {
                 (Some(first_nodes), Some(second_nodes)) => {
                     first_nodes.append(second_nodes);
                     Ok(first_token)
@@ -287,20 +354,15 @@ pub mod sdk {
 
     #[pymethods]
     impl NodeToken {
-        /// Get the memory identity of the node.
-        pub fn id(&self) -> usize {
-            &self.signal_handle as *const SignalHandle as usize
-        }
-        // impl on NodeToken so all nodes benefit
-        pub fn __hash__(&self) -> usize {
-            self.id()
-        }
-        pub fn __eq__(&self, other: &NodeToken) -> bool {
-            self == other
-        }
         /// Send signal.
         pub fn signal(&self, signal: Signal) -> PyResult<()> {
-            self.signal_handle.signal(signal)
+            match self.signal_sender.try_send(signal){
+                Ok(()) => Ok(()),
+                Err(err) => match err {
+                    TrySendError::Closed(_) => Err(PyRuntimeError::new_err("Signal receiver is closed")),
+                    TrySendError::Full(_) => Err(PyRuntimeError::new_err("Signal receiver is full"))
+                }
+            }
         }
         /// Spawn tokio runtime and run blocked.
         pub fn spawn(&mut self) -> PyResult<Option<Signal>> {
@@ -324,35 +386,31 @@ pub mod sdk {
     #[pyclass]
     pub struct GraphNode {
         pub nodes: Vec<NodeToken>,
-        pub signal_handler: Receiver<Signal>,
-        pub upstreams: Vec<Upstream>,
-        pub downstreams: Vec<Downstream>
+        pub signal_receiver: Receiver<Signal>
     }
 
     #[async_trait]
     impl Node for GraphNode {
-        fn upstreams(&mut self) -> &mut [Upstream] {
-            let mut flat = Vec::new();
+        fn upstreams(&self) -> Vec<NodeEndToken> {
+            let mut upstreams = Vec::new();
             for token in &self.nodes {
                 let mut guard = token.node.try_lock().expect("Node is running");
                 let node = guard.as_mut();
-                flat.extend(node.upstreams().iter().cloned());
+                upstreams.extend(node.upstreams().iter().cloned());
             }
-            self.upstreams = flat;
-            &mut self.upstreams
+            upstreams
         }
-        fn downstreams(&mut self) -> &mut [Downstream] {
-            let mut flat = Vec::new();
+        fn downstreams(&self) -> Vec<NodeEndToken> {
+            let mut downstreams = Vec::new();
             for token in &self.nodes {
                 let mut guard = token.node.try_lock().expect("Node is running");
                 let node = guard.as_mut();
-                flat.extend(node.downstreams().iter().cloned());
+                downstreams.extend(node.downstreams().iter().cloned());
             }
-            self.downstreams = flat;
-            &mut self.downstreams
+            downstreams
         }
         async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            while self.signal_handler.try_recv().is_ok() {}
+            while self.signal_receiver.try_recv().is_ok() {}
             for token in &self.nodes {
                 if token.node.try_lock().is_err() {
                     return Err("Node is already running");
@@ -366,7 +424,7 @@ pub mod sdk {
             loop {
                 tokio::select! {
                     biased;
-                    signal = self.signal_handler.recv() => match signal {
+                    signal = self.signal_receiver.recv() => match signal {
                         Some(signal) => {
                             for token in &self.nodes {
                                 let _ = token.signal(signal);
@@ -391,8 +449,8 @@ pub mod sdk {
                 }
             }
         }
-        fn nodes(&mut self) -> Option<&mut Vec<NodeToken>> {
-            Some(&mut self.nodes)
+        fn nodes(&self) -> Option<Vec<NodeToken>> {
+            Some(self.nodes.clone())
         }
     }
 
@@ -401,151 +459,17 @@ pub mod sdk {
         #[new]
         #[pyo3(signature = (nodes = None))]
         pub fn new(nodes: Option<Vec<NodeToken>>) -> NodeToken {
-            let (sender, receiver) = channel(8);
+            let (signal_sender, signal_receiver) = channel(8);
             NodeToken {
                 node: Arc::new(MutexTokio::new(Box::new(Self {
                     nodes: match nodes {
                         Some(nodes) => nodes,
                         None => Vec::new()
                     },
-                    signal_handler: receiver,
-                    upstreams: Vec::new(),
-                    downstreams: Vec::new()
+                    signal_receiver
                 }))),
-                signal_handle: SignalHandle(sender),
+                signal_sender,
             }
-        }
-    }
-
-
-    /// Python arg type
-    #[derive(IntoPyObject)]
-    pub enum PacketSignalError {
-        Packet(Packet),
-        Signal(Signal),
-        Error(PyErr)
-    }
-
-    /// Python return type
-    #[derive(FromPyObject)]
-    pub enum PythonCallbackReturnCode {
-        Control(bool),
-        Signal(Signal)
-    }
-    
-    /// Python arg type
-    #[pyclass(skip_from_py_object, frozen)]
-    #[derive(Clone)]
-    pub struct DownstreamHandle(pub Sender<Packet>);
-
-    #[pymethods]
-    impl DownstreamHandle {
-        pub fn send(&self, packet: Packet) -> PyResult<()> {
-            match self.0.try_send(packet) {
-                Ok(()) => Ok(()),
-                Err(err) => match err {
-                    TrySendError::Full(_) => Err(PyBufferError::new_err("Queue is full")),
-                    TrySendError::Closed(_) => Err(PyEOFError::new_err("Queue closed"))
-                }
-            }
-        }
-    }
-
-    #[pyclass]
-    pub struct PythonNode {
-        pub upstreams: Vec<Upstream>,
-        pub downstreams: Vec<Downstream>,
-        pub signal_handler: Receiver<Signal>,
-        pub callback: Py<PyAny>
-    }
-
-    #[pymethods]
-    impl PythonNode {
-        #[new]
-        pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> PyResult<NodeToken> {
-            if !callback.is_callable() {
-                return Err(PyValueError::new_err("Callback not callable"));
-            }
-            let mut u = Vec::with_capacity(upstreams);
-            let mut d = Vec::with_capacity(downstreams);
-            u.resize_with(upstreams, || Arc::new(MutexStd::new(None)));
-            d.resize_with(downstreams, || Arc::new(MutexStd::new(None)));
-            let (signal_handle, signal_handler) = channel(8);
-            Ok(NodeToken {
-                node: Arc::new(MutexTokio::new(Box::new(Self {
-                    upstreams: u,
-                    downstreams: d,
-                    signal_handler: signal_handler,
-                    callback: callback.unbind()
-                }))),
-                signal_handle: SignalHandle(signal_handle)
-            })
-        }
-    }
-
-    #[async_trait]
-    impl Node for PythonNode {
-        fn upstreams(&mut self) -> &mut [Upstream] {
-            &mut self.upstreams[..]
-        }
-        fn downstreams(&mut self) -> &mut [Downstream] {
-            &mut self.downstreams[..]
-        }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            if self.upstreams.iter().any(|upstream| upstream.lock().unwrap().is_none()) {
-                return Err("Node is improperly connected");
-            }
-            if self.downstreams.iter().any(|downstream| downstream.lock().unwrap().is_none()) {
-                return Err("Node is improperly connected");
-            }
-            let mut receivers: Vec<Receiver<Packet>> = self.upstreams.iter()
-                .map(|upstream| upstream.lock().unwrap().take().expect("Connection is gone"))
-                .collect();
-            let downstreams = Python::attach(|py| {
-                PyList::new(py, self.downstreams.iter()
-                    .map(|downstream| DownstreamHandle(downstream.lock().unwrap().clone().expect("Connection is gone"))))
-                    .map(|list| list.unbind())
-            }).map_err(|_| "Cannot create downstream handles")?;
-            loop {
-                let (index, outcome) = {
-                    if receivers.is_empty() {
-                        let outcome = match self.signal_handler.recv().await {
-                            Some(signal) => PacketSignalError::Signal(signal),
-                            None => PacketSignalError::Error(PyEOFError::new_err("Signal handle closed"))
-                        };
-                        break (-1, outcome);
-                    }
-                    let packets = receivers.iter_mut().map(|upstream| {
-                        Box::pin(async move {
-                            match upstream.recv().await {
-                                Some(packet) => PacketSignalError::Packet(packet),
-                                None => PacketSignalError::Error(PyEOFError::new_err("Queue closed"))
-                            }
-                        }) as Pin<Box<dyn Future<Output = PacketSignalError> + Send + '_>>
-                    });
-                    tokio::select! {
-                        biased;
-                        signal = self.signal_handler.recv() => match signal {
-                            Some(signal) => (-1, PacketSignalError::Signal(signal)),
-                            None => (-1, PacketSignalError::Error(PyEOFError::new_err("Signal handle closed")))
-                        },
-                        (outcome, index, _) = select_all(packets) => (index as isize, outcome),
-                    }
-                };
-                match Python::attach(|py| {
-                    self.callback.call1(py, (index, PacketSignalError::from(outcome), downstreams.clone_ref(py)))
-                        .ok()
-                        .and_then(|object| object.bind(py).extract::<PythonCallbackReturnCode>().ok())
-                        .unwrap_or(PythonCallbackReturnCode::Signal(Signal::SIGKILL))
-                }) {
-                    PythonCallbackReturnCode::Control(control) => match control {
-                        false => continue,
-                        true => return Ok(None)
-                    },
-                    PythonCallbackReturnCode::Signal(signal) => return Ok(Some(signal)),
-                }
-            };
-            unimplemented!()
         }
     }
 }
