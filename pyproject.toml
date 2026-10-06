@@ -24,11 +24,3 @@ dev = [
     "penprox",
     "ruff>=0.16.5",
 ]
-
-[tool.uv.workspace]
-members = [
-    ".",
-]
-
-[tool.uv.sources]
-penprox = { workspace = true }

@@ -1,5 +1,5 @@
 """
-Proxy toolbox specialized in firewall penetration.
+High performance python proxy toolbox specialized in firewall penetration
 
 [Github repository](https://github.com/Scevenate/penprox)
 """

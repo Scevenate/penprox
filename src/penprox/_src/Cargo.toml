@@ -1,0 +1,17 @@
+[package]
+name = "penprox"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["library"]
+library = []
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+pyo3.workspace = true
+tokio.workspace = true
