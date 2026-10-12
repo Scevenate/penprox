@@ -1,16 +1,24 @@
 #[pyo3::pymodule]
 pub mod sdk {
-    use std::{hash::{Hash, Hasher}, net::IpAddr, sync::{Arc, OnceLock, Mutex as MutexStd}};
+    use std::{hash::{Hash, Hasher}, net::IpAddr, pin::Pin, sync::{Arc, OnceLock, Mutex as MutexStd}};
     use async_trait::async_trait;
+    use futures::future::select_all;
     use pyo3::{Borrowed, FromPyObject, IntoPyObject, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
-    use tokio::{sync::{Mutex as MutexTokio, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::JoinSet};
+    use tokio::{sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::JoinSet};
 
+    /// Maximum amount of data packets a connection can safely buffer.
+    pub const ON_FLIGHT_SIZE: usize = 64;
+
+    /// Exposed connection Host type.
+    /// 
+    /// Connection host is mutable only for DNS resolution.
     #[derive(FromPyObject, IntoPyObject, Clone)]
     pub enum Host {
         Domain(String),
-        Ip(IpAddr)
+        IpAddr(IpAddr)
     }
 
+    /// Immutable connection transport type.
     #[derive(Clone, Copy)]
     pub enum Transport {
         TCP,
@@ -43,15 +51,13 @@ pub mod sdk {
         }
     }
 
-    /// Inner data struct & memory identity of a connection.
-    /// 
-    /// The connection is generally immutable and has a uncopiable memory identity.
-    pub struct Connection {
+    /// Opaque identity of a connection.
+    struct Connection {
         domain: Option<String>,
-        /// This must be set if domain is None.
         ip: OnceLock<IpAddr>,
         transport: Transport,
-        port: u8
+        port: u16,
+        buffer: Semaphore
     }
 
     /// General representation of a connection.
@@ -71,6 +77,24 @@ pub mod sdk {
         }
     }
 
+    impl ConnectionToken {
+        async fn acquire(&self) {
+            self.0.buffer.acquire().await.expect("Semaphore was closed").forget();
+        }
+        fn try_acquire(&self) -> Result<(), ()> {
+            match self.0.buffer.try_acquire() {
+                Ok(permit) => {
+                    permit.forget();
+                    Ok(())
+                },
+                _ => Err(())
+            }
+        }
+        fn release(&self) {
+            self.0.buffer.add_permits(1);
+        }
+    }
+
     #[pymethods]
     impl ConnectionToken {
         /// Idempotently set IP.
@@ -79,26 +103,28 @@ pub mod sdk {
         }
         /// Initialize new connection.
         #[new]
-        pub fn new(host: Host, transport: Transport, port: u8) -> Self {
+        pub fn new(host: Host, transport: Transport, port: u16) -> Self {
             match host {
                 Host::Domain(domain) => Self(Arc::new(Connection {
                     domain: Some(domain),
                     ip: OnceLock::new(),
                     transport,
-                    port
+                    port,
+                    buffer: Semaphore::new(ON_FLIGHT_SIZE)
                 })),
-                Host::Ip(ip_addr) => Self(Arc::new(Connection {
+                Host::IpAddr(ip_addr) => Self(Arc::new(Connection {
                     domain: None,
                     ip: OnceLock::from(ip_addr),
                     transport,
-                    port
+                    port,
+                    buffer: Semaphore::new(ON_FLIGHT_SIZE)
                 }))
             }
         }
         #[getter]
         pub fn host(&self) -> PyResult<Host> {
             match self.0.ip.get() {
-                Some(ip_addr) => Ok(Host::Ip(*ip_addr)),
+                Some(ip_addr) => Ok(Host::IpAddr(*ip_addr)),
                 None => Ok(Host::Domain(self.0.domain.clone().expect("Connection has no host")))
             }
         }
@@ -107,14 +133,12 @@ pub mod sdk {
             self.0.transport
         }
         #[getter]
-        pub fn port(&self) -> u8 {
+        pub fn port(&self) -> u16 {
             self.0.port
         }
     }
 
     /// Payload, field owned by a packet.
-    /// 
-    /// Also `Literal["SYN", "FIN"] | bytes` python parameter type.
     #[derive(Clone)]
     pub enum Payload {
         SYN,
@@ -152,121 +176,198 @@ pub mod sdk {
         }
     }
 
-    /// General representation of a packet.
-    #[pyclass(from_py_object)]
-    #[derive(Clone)]
     pub struct Packet {
-        #[pyo3(get, set)]
-        pub connection: ConnectionToken,
-        #[pyo3(get, set)]
+        connection: ConnectionToken,
         pub payload: Payload
     }
 
-    #[pymethods]
+    impl Drop for Packet {
+        fn drop(&mut self) {
+            self.connection.release();
+        }
+    }
+
     impl Packet {
-        /// Initialize new packet.
-        #[new]
-        pub fn new(connection: ConnectionToken, payload: Payload) -> Self {
+        pub async fn new(connection: ConnectionToken, payload: Payload) -> Self {
+            connection.acquire().await;
             Self {
-                connection: connection,
-                payload: payload
+                connection,
+                payload
+            }
+        }
+        pub fn try_new(connection: ConnectionToken, payload: Payload) -> Result<Self, ()> {
+            connection.try_acquire()?;
+            Ok(Self {
+                connection,
+                payload
+            })
+        }
+        pub fn connection(&self) -> &ConnectionToken {
+            &self.connection
+        }
+        pub fn to_pypacket(&self) -> PyPacket {
+            PyPacket {
+                connection: self.connection.clone(),
+                payload: self.payload.clone()
             }
         }
     }
 
+    /// Rust, in-graph packet.
+    /// 
+    /// The total amount of packets a connection can buffer is limited.
+    #[pyclass(name="Packet", from_py_object)]
+    #[derive(Clone)]
+    pub struct PyPacket {
+        connection: ConnectionToken,
+        payload: Payload
+    }
+
+    impl PyPacket {
+        pub async fn into_packet(self) -> Packet {
+            Packet::new(self.connection, self.payload).await
+        }
+
+        pub fn try_to_packet<'py>(self) -> Result<Packet, ()> {
+            Packet::try_new(self.connection.clone(), self.payload.clone())
+        }
+    }
+
+    /// Python packet detached from the graph.
+    #[pymethods]
+    impl PyPacket {
+        #[new]
+        fn python_new(connection: ConnectionToken, payload: Payload) -> Self {
+            Self {
+                connection,
+                payload
+            }
+        }
+    }
+
+    /// Unidirectional control message with high scheduling priority.
     #[pyclass(from_py_object, frozen, eq)]
     #[derive(Clone, Copy, Eq, PartialEq)]
     pub enum Signal {
-        SIGKILL,
+        /// Ask a node to quit.
+        /// 
+        /// The node should clear up its private resources; Graph state consistency
+        /// is not required. (e.g. No need to close connections)
+        SIGTERM,
+        /// Node-specific signal.
+        /// 
+        /// Unrecognized signals are simply discarded.
         SIGUSR1,
+        /// Node-specific signal.
+        /// 
+        /// Unrecognized signals are simply discarded.
         SIGUSR2
     }
 
     /// Inner data struct of a node end.
-    pub struct NodeEnd {
-        pub receiver: Receiver<Packet>,
-        pub sender: Sender<Packet>
+    struct NodeEnd {
+        receiver: Arc<Mutex<Receiver<Packet>>>,
+        sender: Sender<Packet>
     }
 
     /// General representation of a node end.
     /// 
-    /// The lock is short held unless the node is running.
+    /// The lock is only for edge manipulation and is always short held.
     #[pyclass(from_py_object)]
     #[derive(Clone)]
-    pub struct NodeEndToken(pub Arc<MutexStd<Option<NodeEnd>>>);
+    pub struct NodeEndToken(Arc<MutexStd<Option<NodeEnd>>>);
+
+    impl NodeEndToken {
+        pub fn new() -> Self {
+            Self(Arc::new(MutexStd::new(None)))
+        }
+        pub fn set(&self, sender: Sender<Packet>, receiver: Receiver<Packet>) {
+            let mut guard = self.0.lock().expect("End is poisoned");
+            *guard = Some(NodeEnd {
+                receiver: Arc::new(Mutex::new(receiver)),
+                sender
+            })
+        }
+        pub fn sender(&self) -> Option<Sender<Packet>> {
+            let guard = self.0.lock().expect("End is poisoned");
+            match guard.as_ref() {
+                Some(node_end) => Some(node_end.sender.clone()),
+                None => None
+            }
+        }
+        pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<Packet>>, &'static str> {
+            let guard = self.0.lock().expect("End is poisoned");
+            match guard.as_ref() {
+                Some(node_end) => node_end.receiver.clone().try_lock_owned().or(Err("End is occupied")),
+                None => Err("End is none")
+            }
+        }
+    }
 
     #[pymethods]
     impl NodeEndToken {
-        pub fn empty(&self) -> PyResult<bool> {
-            let Ok(guard) = &mut self.0.try_lock() else {
-                return PyResult::Err(PyRuntimeError::new_err("End is occupied"));
+        pub fn is_none(&self) -> PyResult<bool> {
+            let Ok(guard) = self.0.lock() else {
+                return Err(PyRuntimeError::new_err("End is poisoned"));
             };
-            Ok(guard.as_ref().is_some())
+            Ok(guard.is_none())
         }
-        pub fn send(&self, packet: Packet) -> PyResult<()> {
-            let Ok(guard) = &mut self.0.try_lock() else {
-                return PyResult::Err(PyRuntimeError::new_err("End is occupied"));
+        fn put_nowait<'py>(&self, packet: PyPacket) -> PyResult<()> {
+            let Ok(packet) = packet.try_to_packet() else {
+                return Err(PyBufferError::new_err("Cannot create new packet"))
             };
-            let Some(node_end) = guard.as_mut() else {
-                return PyResult::Err(PyRuntimeError::new_err("End is empty"));
+            let Some(sender) = self.sender() else {
+                return Err(PyRuntimeError::new_err("End is none"));
             };
-            match node_end.sender.try_send(packet) {
+            match sender.try_send(packet) {
                 Ok(_) => Ok(()),
-                Err(err) => match err {
-                    TrySendError::Closed(_) => Err(PyEOFError::new_err("End is closed")),
-                    TrySendError::Full(_) => Err(PyBufferError::new_err("End is full")) 
+                Err(err) => {
+                    match err {
+                        TrySendError::Closed(_) => Err(PyEOFError::new_err("End is closed")),
+                        TrySendError::Full(_) => Err(PyBufferError::new_err("End is full")) 
+                    }
                 }
+            }
+        }
+        async fn put<'py>(&self, packet: PyPacket) -> PyResult<()> {
+            let packet = packet.into_packet().await;
+            let Some(sender) = self.sender() else {
+                return Err(PyRuntimeError::new_err("End is none"));
+            };
+            match sender.send(packet).await {
+                Ok(_) => Ok(()),
+                _ => Err(PyEOFError::new_err("End is closed"))
             }
         }
     }
 
     /// Basic node interface.
-    /// 
-    /// Unfortunately trait cannot be pymethods, so additional helper methods are added.
     #[async_trait]
     pub trait Node: Send {
         fn upstreams(&self) -> Vec<NodeEndToken>;
         fn downstreams(&self) -> Vec<NodeEndToken>;
         async fn run(&mut self) -> Result<Option<Signal>, &'static str>;
-        /// Function for merging graphs
-        fn nodes(&self) -> Option<Vec<NodeToken>> { None }
-    }
-
-    #[pyfunction]
-    pub fn get_node_upstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
-        match node.node.try_lock().as_mut() {
-            Ok(node) => Ok(node.upstreams()),
-            _ => Err(PyRuntimeError::new_err("Node is running"))
-        }
-    }
-
-    #[pyfunction]
-    pub fn get_node_downstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
-        match node.node.try_lock().as_mut() {
-            Ok(node) => Ok(node.downstreams()),
-            _ => Err(PyRuntimeError::new_err("Node is running"))
-        }
-    }
-
-    #[pyfunction]
-    pub fn get_node_nodes(node: &NodeToken) -> PyResult<Option<Vec<NodeToken>>> {
-        match node.node.try_lock().as_mut() {
-            Ok(node) => Ok(node.nodes()),
-            _ => Err(PyRuntimeError::new_err("Node is running"))
-        }
+        /// For merging graphs
+        fn nodes(&mut self) -> Option<&mut Vec<NodeToken>> { None }
     }
 
     /// General representation of a node.
     /// 
     /// The node lock is long held when running.
-    #[pyclass(from_py_object, name="Node")] // `eq` / `hash` requires immutability so we'll custom memory id impl
+    #[pyclass(from_py_object, name="Node")]
     #[derive(Clone)]
     pub struct NodeToken {
-        pub node: Arc<MutexTokio<Box<dyn Node>>>,
-        pub signal_sender: Sender<Signal>
+        node: Arc<Mutex<Box<dyn Node>>>,
+        signal_sender: Sender<Signal>
     }
 
     impl NodeToken {
+        pub fn new(node: Box<dyn Node>, signal_sender: Sender<Signal>) -> Self {
+            Self {
+                node: Arc::new(Mutex::new(node)),
+                signal_sender
+            }
+        }
         /// Lock & run as rust `Future`.
         pub async fn run(&mut self) -> Result<Result<Option<Signal>, &'static str>, &'static str> {
             let mut guard = self.node.try_lock().map_err(|_| "Node is running")?;
@@ -278,18 +379,10 @@ pub mod sdk {
             let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
             let upstream_downstreams = upstream_guard.as_mut().downstreams();
             let downstream_upstreams = downstream_guard.as_mut().upstreams();
-            let mut upstream_downstream = upstream_downstreams[downstream_index].0.try_lock().expect("Cannot lock node end");
-            let mut downstream_upstream = downstream_upstreams[upstream_index].0.lock().expect("Cannot lock node end");
             let (sender1, receiver1) = channel(32);
             let (sender2, receiver2) = channel(32);
-            *upstream_downstream = Some(NodeEnd {
-                sender: sender1,
-                receiver: receiver2
-            });
-            *downstream_upstream = Some(NodeEnd {
-                sender: sender2,
-                receiver: receiver1
-            });
+            upstream_downstreams[downstream_index].set(sender1, receiver2);
+            downstream_upstreams[upstream_index].set(sender2, receiver1);
             Ok(())
         }
         /// Connect upstream empty downstreams to downstream empty upstreams until either side is fully connected.
@@ -326,7 +419,7 @@ pub mod sdk {
         /// If only one have nodes(), the other is pushed front / back.
         /// 
         /// If none have nodes(), a new GraphNode containing the two nodes is constructed.
-        pub fn merge(first: &mut NodeToken, second: &mut NodeToken) -> Result<NodeToken, &'static str> {
+        pub fn merge(first: &NodeToken, second: &NodeToken) -> Result<NodeToken, &'static str> {
             // Avoid borrow lifetime problems
             let first_token = first.clone();
             let second_token = second.clone();
@@ -373,16 +466,16 @@ pub mod sdk {
                 .map_err(|err| PyRuntimeError::new_err(err))?
                 .map_err(|err| PyRuntimeError::new_err(err))?)
         }
-        pub fn __rshift__(&mut self, other: &mut NodeToken) -> PyResult<NodeToken> {
+        fn __rshift__(&mut self, other: &mut NodeToken) -> PyResult<NodeToken> {
             NodeToken::connect_all(self, other).map_err(|err| PyRuntimeError::new_err(err))?;
             Ok(NodeToken::merge(self, other).map_err(|err| PyRuntimeError::new_err(err))?)
         }
-        pub fn __add__(&mut self, other: &mut NodeToken) -> PyResult<NodeToken> {
+        fn __add__(&mut self, other: &mut NodeToken) -> PyResult<NodeToken> {
             Ok(NodeToken::merge(self, other).map_err(|err| PyRuntimeError::new_err(err))?)
         }
     }
 
-    /// General representation of a graph, a special reserved node supporting hierarchical construction.
+    /// A special node supporting hierarchical construction.
     #[pyclass]
     pub struct GraphNode {
         pub nodes: Vec<NodeToken>,
@@ -430,7 +523,7 @@ pub mod sdk {
                                 let _ = token.signal(signal);
                             }
                         }
-                        None => return Ok(None)
+                        None => return Err("Signal receiver is closed")
                     },
                     joined = tasks.join_next() => match joined {
                         None => return Ok(None),
@@ -442,15 +535,15 @@ pub mod sdk {
                         Some(Ok(Ok(Ok(None)))) => {}
                         Some(Ok(Ok(Err(_)))) | Some(Ok(Err(_))) | Some(Err(_)) => {
                             for token in &self.nodes {
-                                let _ = token.signal(Signal::SIGKILL);
+                                let _ = token.signal(Signal::SIGTERM);
                             }
                         }
                     }
                 }
             }
         }
-        fn nodes(&self) -> Option<Vec<NodeToken>> {
-            Some(self.nodes.clone())
+        fn nodes(&mut self) -> Option<&mut Vec<NodeToken>> {
+            Some(&mut self.nodes)
         }
     }
 
@@ -461,7 +554,7 @@ pub mod sdk {
         pub fn new(nodes: Option<Vec<NodeToken>>) -> NodeToken {
             let (signal_sender, signal_receiver) = channel(8);
             NodeToken {
-                node: Arc::new(MutexTokio::new(Box::new(Self {
+                node: Arc::new(Mutex::new(Box::new(Self {
                     nodes: match nodes {
                         Some(nodes) => nodes,
                         None => Vec::new()
@@ -469,6 +562,153 @@ pub mod sdk {
                     signal_receiver
                 }))),
                 signal_sender,
+            }
+        }
+    }
+
+    /// Python arg type
+    #[pyclass(skip_from_py_object)]
+    #[derive(Clone, Copy)]
+    enum ChannelType {
+        Signal,
+        Upstream,
+        Downstream
+    }
+
+    /// Python arg type
+    #[derive(IntoPyObject)]
+    enum PyPacketSignalError {
+        PyPacket(PyPacket),
+        Signal(Signal),
+        Error(())
+    }
+
+    /// Python return type
+    #[derive(FromPyObject)]
+    enum PythonCallbackReturnCode {
+        Control(bool),
+        Signal(Signal)
+    }
+
+    #[pyclass]
+    pub struct PythonNode {
+        pub upstreams: Vec<NodeEndToken>,
+        pub downstreams: Vec<NodeEndToken>,
+        pub signal_receiver: Receiver<Signal>,
+        pub callback: Py<PyAny>
+    }
+
+    #[pyfunction]
+    fn get_python_node_upstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
+        match node.node.try_lock().as_mut() {
+            Ok(node) => Ok(node.upstreams()),
+            _ => Err(PyRuntimeError::new_err("Node is running"))
+        }
+    }
+
+    #[pyfunction]
+    fn get_python_node_downstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
+        match node.node.try_lock().as_mut() {
+            Ok(node) => Ok(node.downstreams()),
+            _ => Err(PyRuntimeError::new_err("Node is running"))
+        }
+    }
+
+    #[pymethods]
+    impl PythonNode {
+        #[new]
+        pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> PyResult<NodeToken> {
+            if !callback.is_callable() {
+                return Err(PyValueError::new_err("Callback not callable"));
+            }
+            let mut u = Vec::with_capacity(upstreams);
+            let mut d = Vec::with_capacity(downstreams);
+            u.resize_with(upstreams, || NodeEndToken(Arc::new(MutexStd::new(None))));
+            d.resize_with(downstreams, || NodeEndToken(Arc::new(MutexStd::new(None))));
+            let (signal_sender, signal_receiver) = channel(8);
+            Ok(NodeToken {
+                node: Arc::new(Mutex::new(Box::new(Self {
+                    upstreams: u,
+                    downstreams: d,
+                    signal_receiver,
+                    callback: callback.unbind()
+                }))),
+                signal_sender
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Node for PythonNode {
+        fn upstreams(&self) -> Vec<NodeEndToken> {
+            self.upstreams.clone()
+        }
+        fn downstreams(&self) -> Vec<NodeEndToken> {
+            self.downstreams.clone()
+        }
+        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
+            let mut upstreams: Vec<OwnedMutexGuard<Receiver<Packet>>> = Vec::with_capacity(self.upstreams.len());
+            for upstream in &mut self.upstreams {
+                upstreams.push(upstream.receiver()?);
+            }
+            let mut downstreams: Vec<OwnedMutexGuard<Receiver<Packet>>> = Vec::with_capacity(self.downstreams.len());
+            for downstream in &mut self.downstreams {
+                downstreams.push(downstream.receiver()?);
+            }
+            loop {
+                let ((channel_type, index), outcome) = {
+                    let mut tags: Vec<(ChannelType, usize)> = Vec::with_capacity(upstreams.len() + downstreams.len());
+                    let mut packets: Vec<Pin<Box<dyn Future<Output = PyPacketSignalError> + Send + '_>>> = Vec::with_capacity(upstreams.len() + downstreams.len());
+                    for (index, receiver) in upstreams.iter_mut().enumerate() {
+                        tags.push((ChannelType::Upstream, index));
+                        packets.push(Box::pin(async move {
+                            match receiver.recv().await {
+                                Some(packet) => PyPacketSignalError::PyPacket(packet.to_pypacket()),
+                                None => PyPacketSignalError::Error(())
+                            }
+                        }));
+                    }
+                    for (index, receiver) in downstreams.iter_mut().enumerate() {
+                        tags.push((ChannelType::Downstream, index));
+                        packets.push(Box::pin(async move {
+                            match receiver.recv().await {
+                                Some(packet) => PyPacketSignalError::PyPacket(packet.to_pypacket()),
+                                None => PyPacketSignalError::Error(())
+                            }
+                        }));
+                    }
+                    if packets.is_empty() {
+                        match self.signal_receiver.recv().await {
+                            Some(signal) => ((ChannelType::Signal, 0), PyPacketSignalError::Signal(signal)),
+                            None => return Err("Signal handle closed")
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            signal = self.signal_receiver.recv() => match signal {
+                                Some(signal) => ((ChannelType::Signal, 0), PyPacketSignalError::Signal(signal)),
+                                None => return Err("Signal handle closed")
+                            },
+                            (outcome, position, _) = select_all(packets) => (tags[position], outcome),
+                        }
+                    }
+                };
+                if matches!(&outcome, PyPacketSignalError::Error(())) {
+                    return Err("End is closed");
+                }
+                let result = Python::attach(|py| {
+                    let channel_type = Py::new(py, channel_type)?;
+                    let object = self.callback.call1(py, (channel_type, index, outcome))?;
+                    object.bind(py).extract::<PythonCallbackReturnCode>()
+                });
+                match result {
+                    Ok(PythonCallbackReturnCode::Control(control)) => match control {
+                        false => continue,
+                        true => return Ok(None)
+                    },
+                    Ok(PythonCallbackReturnCode::Signal(signal)) => return Ok(Some(signal)),
+                    Err(_) => return Ok(Some(Signal::SIGTERM)),
+                }
             }
         }
     }
