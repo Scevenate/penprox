@@ -1,24 +1,59 @@
 #[pyo3::pymodule]
 pub mod sdk {
-    use std::{hash::{Hash, Hasher}, net::IpAddr, pin::Pin, sync::{Arc, OnceLock, Mutex as MutexStd}};
+    use std::{hash::{Hash, Hasher}, net::IpAddr, pin::Pin, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
     use async_trait::async_trait;
     use futures::future::select_all;
     use pyo3::{Borrowed, FromPyObject, IntoPyObject, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
-    use tokio::{sync::{Mutex, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::JoinSet};
+    use tokio::{sync::{Mutex, OwnedMutexGuard, Semaphore, TryAcquireError, TryLockError, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
 
-    /// Maximum amount of data packets a connection can safely buffer.
-    pub const ON_FLIGHT_SIZE: usize = 64;
+    pub const PACKET_BUFFER_SIZE: usize = 64;
+    pub const SIGNAL_BUFFER_SIZE: usize = 8;
+    pub const PACKET_DATA_SIZE: usize = 2048;
+    /// Maximum amount of packets a connection can safely buffer.
+    pub const CONNECTION_BUFFER_SIZE: usize = 64;
 
-    /// Exposed connection Host type.
-    /// 
-    /// Connection host is mutable only for DNS resolution.
+    /// A python-compatible utility enum with "both" option.
+    #[derive(Copy, Clone)]
+    pub enum AddressMode {
+        V4,
+        V6,
+        V4V6
+    }
+
+    impl<'a, 'py> FromPyObject<'a, 'py> for AddressMode {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            match obj.cast::<PyString>() {
+                Ok(obj) => match obj.to_str() {
+                    Ok("v4") => Ok(AddressMode::V4),
+                    Ok("v6") => Ok(AddressMode::V6),
+                    Ok("v4v6") => Ok(AddressMode::V4V6),
+                    _ => Err(PyValueError::new_err("Invalid Value"))
+                },
+                _ => Err(PyValueError::new_err("Invalid Value"))
+            }
+        }
+    }
+
+    impl<'py> IntoPyObject<'py> for AddressMode {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            match self {
+                AddressMode::V4 => Ok(PyString::new(py, "v4").into_any()),
+                AddressMode::V6 => Ok(PyString::new(py, "v6").into_any()),
+                AddressMode::V4V6 => Ok(PyString::new(py, "v4v6").into_any())
+            }
+        }
+    }
+
     #[derive(FromPyObject, IntoPyObject, Clone)]
     pub enum Host {
         Domain(String),
         IpAddr(IpAddr)
     }
 
-    /// Immutable connection transport type.
     #[derive(Clone, Copy)]
     pub enum Transport {
         TCP,
@@ -43,7 +78,7 @@ pub mod sdk {
         type Error = PyErr;
         type Target = PyAny;
         type Output = Bound<'py, Self::Target>;
-        fn into_pyobject(self: Self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
             match self {
                 Transport::TCP => Ok(PyString::new(py, "TCP").into_any()),
                 Transport::UDP => Ok(PyString::new(py, "UDP").into_any()),
@@ -51,7 +86,6 @@ pub mod sdk {
         }
     }
 
-    /// Opaque identity of a connection.
     struct Connection {
         domain: Option<String>,
         ip: OnceLock<IpAddr>,
@@ -61,12 +95,18 @@ pub mod sdk {
     }
 
     /// General representation of a connection.
+    /// 
+    /// The endpoint (host, transport, port) has node-dependent meaning:
+    /// - For inbound network connection, the host is remote source.
+    /// - For outbound network connection, the host is remote destination.
+    /// - For proxied connection, the host is the intended proxy destination.
     #[pyclass(from_py_object, frozen, eq, hash, name="Connection")]
     #[derive(Clone)]
     pub struct ConnectionToken(Arc<Connection>);
 
     impl Eq for ConnectionToken {}
     impl PartialEq for ConnectionToken {
+        #[allow(clippy::ptr_eq)]
         fn eq(&self, other: &Self) -> bool {
             self.0.as_ref() as *const Connection as usize == other.0.as_ref() as *const Connection as usize
         }
@@ -81,27 +121,29 @@ pub mod sdk {
         async fn acquire(&self) {
             self.0.buffer.acquire().await.expect("Semaphore was closed").forget();
         }
-        fn try_acquire(&self) -> Result<(), ()> {
-            match self.0.buffer.try_acquire() {
-                Ok(permit) => {
-                    permit.forget();
-                    Ok(())
-                },
-                _ => Err(())
-            }
+        fn try_acquire(&self) -> Result<(), TryAcquireError> {
+            self.0.buffer.try_acquire()?.forget();
+            Ok(())
         }
         fn release(&self) {
             self.0.buffer.add_permits(1);
         }
     }
 
+    impl ConnectionToken {
+        pub fn is_resolved(&self) -> bool {
+            self.0.ip.get().is_some()
+        }
+    }
+
     #[pymethods]
     impl ConnectionToken {
-        /// Idempotently set IP.
+        /// Set IP.
+        /// 
+        /// Fails silently if IP is already set.
         pub fn resolve(&self, ip_addr: IpAddr) {
             let _ = self.0.ip.set(ip_addr);
         }
-        /// Initialize new connection.
         #[new]
         pub fn new(host: Host, transport: Transport, port: u16) -> Self {
             match host {
@@ -110,22 +152,22 @@ pub mod sdk {
                     ip: OnceLock::new(),
                     transport,
                     port,
-                    buffer: Semaphore::new(ON_FLIGHT_SIZE)
+                    buffer: Semaphore::new(CONNECTION_BUFFER_SIZE)
                 })),
                 Host::IpAddr(ip_addr) => Self(Arc::new(Connection {
                     domain: None,
                     ip: OnceLock::from(ip_addr),
                     transport,
                     port,
-                    buffer: Semaphore::new(ON_FLIGHT_SIZE)
+                    buffer: Semaphore::new(CONNECTION_BUFFER_SIZE)
                 }))
             }
         }
         #[getter]
-        pub fn host(&self) -> PyResult<Host> {
+        pub fn host(&self) -> Host {
             match self.0.ip.get() {
-                Some(ip_addr) => Ok(Host::IpAddr(*ip_addr)),
-                None => Ok(Host::Domain(self.0.domain.clone().expect("Connection has no host")))
+                Some(ip_addr) => Host::IpAddr(*ip_addr),
+                None => Host::Domain(self.0.domain.clone().expect("Connection has no host"))
             }
         }
         #[getter]
@@ -138,7 +180,6 @@ pub mod sdk {
         }
     }
 
-    /// Payload, field owned by a packet.
     #[derive(Clone)]
     pub enum Payload {
         SYN,
@@ -167,7 +208,7 @@ pub mod sdk {
         type Error = PyErr;
         type Target = PyAny;
         type Output = Bound<'py, Self::Target>;
-        fn into_pyobject(self: Self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
             match self {
                 Payload::SYN => Ok(PyString::new(py, "SYN").into_any()),
                 Payload::FIN => Ok(PyString::new(py, "FIN").into_any()),
@@ -176,6 +217,10 @@ pub mod sdk {
         }
     }
 
+    /// General representation of a packet.
+    /// 
+    /// The amount of packet a connection can safely buffer is limited; 
+    /// When existing Packets reaches this limit, new construction must wait for drop.
     pub struct Packet {
         connection: ConnectionToken,
         pub payload: Payload
@@ -188,6 +233,7 @@ pub mod sdk {
     }
 
     impl Packet {
+        /// Awaits `drop` if the connection reached packet count limit.
         pub async fn new(connection: ConnectionToken, payload: Payload) -> Self {
             connection.acquire().await;
             Self {
@@ -195,49 +241,55 @@ pub mod sdk {
                 payload
             }
         }
-        pub fn try_new(connection: ConnectionToken, payload: Payload) -> Result<Self, ()> {
+        /// Fails if the connection reached packet count limit.
+        pub fn try_new(connection: ConnectionToken, payload: Payload) -> Result<Self, TryAcquireError> {
             connection.try_acquire()?;
             Ok(Self {
                 connection,
                 payload
             })
         }
+        /// Get the connection of the packet.
+        /// 
+        /// The connection of a counted packet is immutable.
         pub fn connection(&self) -> &ConnectionToken {
             &self.connection
         }
-        pub fn to_pypacket(&self) -> PyPacket {
-            PyPacket {
+        pub fn to_weak_packet(&self) -> WeakPacket {
+            WeakPacket {
                 connection: self.connection.clone(),
                 payload: self.payload.clone()
             }
         }
     }
 
-    /// Rust, in-graph packet.
+    /// Note: The reference to the connection is strong. This packet is weak
+    /// in terms of escaping connection packet buffer limit.
     /// 
-    /// The total amount of packets a connection can buffer is limited.
+    /// A weak packet can be simply constructed, but it cannot be accepted in most
+    /// packet buffers.
     #[pyclass(name="Packet", from_py_object)]
     #[derive(Clone)]
-    pub struct PyPacket {
+    pub struct WeakPacket {
         connection: ConnectionToken,
         payload: Payload
     }
 
-    impl PyPacket {
+    impl WeakPacket {
+        /// Awaits `drop` if the connection reached packet count limit.
         pub async fn into_packet(self) -> Packet {
             Packet::new(self.connection, self.payload).await
         }
-
-        pub fn try_to_packet<'py>(self) -> Result<Packet, ()> {
+        /// Fails if the connection reached packet count limit.
+        pub fn try_into_packet(self) -> Result<Packet, TryAcquireError> {
             Packet::try_new(self.connection.clone(), self.payload.clone())
         }
     }
 
-    /// Python packet detached from the graph.
     #[pymethods]
-    impl PyPacket {
+    impl WeakPacket {
         #[new]
-        fn python_new(connection: ConnectionToken, payload: Payload) -> Self {
+        fn new(connection: ConnectionToken, payload: Payload) -> Self {
             Self {
                 connection,
                 payload
@@ -264,22 +316,19 @@ pub mod sdk {
         SIGUSR2
     }
 
-    /// Inner data struct of a node end.
     struct NodeEnd {
         receiver: Arc<Mutex<Receiver<Packet>>>,
         sender: Sender<Packet>
     }
 
     /// General representation of a node end.
-    /// 
-    /// The lock is only for edge manipulation and is always short held.
     #[pyclass(from_py_object)]
-    #[derive(Clone)]
-    pub struct NodeEndToken(Arc<MutexStd<Option<NodeEnd>>>);
+    #[derive(Clone, Default)]
+    pub struct NodeEndToken(Arc<MutexStd<Option<NodeEnd>>>); // This std lock is always short held
 
     impl NodeEndToken {
         pub fn new() -> Self {
-            Self(Arc::new(MutexStd::new(None)))
+            Self::default()
         }
         pub fn set(&self, sender: Sender<Packet>, receiver: Receiver<Packet>) {
             let mut guard = self.0.lock().expect("End is poisoned");
@@ -288,32 +337,31 @@ pub mod sdk {
                 sender
             })
         }
+        /// Get the sender. Returns `None` if node end is none.
         pub fn sender(&self) -> Option<Sender<Packet>> {
             let guard = self.0.lock().expect("End is poisoned");
-            match guard.as_ref() {
-                Some(node_end) => Some(node_end.sender.clone()),
-                None => None
-            }
+            guard.as_ref().map(|node_end| node_end.sender.clone())
         }
-        pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<Packet>>, &'static str> {
+        /// Get the receiver. 
+        /// 
+        /// Returns `Err(())` if the receiver is in use; Returns `Ok(None)` if node end is none.
+        pub fn receiver(&self) -> Result<Option<OwnedMutexGuard<Receiver<Packet>>>, TryLockError> {
             let guard = self.0.lock().expect("End is poisoned");
             match guard.as_ref() {
-                Some(node_end) => node_end.receiver.clone().try_lock_owned().or(Err("End is occupied")),
-                None => Err("End is none")
+                Some(node_end) => Ok(Some(node_end.receiver.clone().try_lock_owned()?)),
+                None => Ok(None)
             }
         }
     }
 
     #[pymethods]
     impl NodeEndToken {
-        pub fn is_none(&self) -> PyResult<bool> {
-            let Ok(guard) = self.0.lock() else {
-                return Err(PyRuntimeError::new_err("End is poisoned"));
-            };
-            Ok(guard.is_none())
+        pub fn is_none(&self) -> bool {
+            self.0.lock().expect("End is poisoned").is_none()
         }
-        fn put_nowait<'py>(&self, packet: PyPacket) -> PyResult<()> {
-            let Ok(packet) = packet.try_to_packet() else {
+        /// This method will fail if the connection reached its packet count limit.
+        fn put_nowait(&self, packet: WeakPacket) -> PyResult<()> {
+            let Ok(packet) = packet.try_into_packet() else {
                 return Err(PyBufferError::new_err("Cannot create new packet"))
             };
             let Some(sender) = self.sender() else {
@@ -329,7 +377,8 @@ pub mod sdk {
                 }
             }
         }
-        async fn put<'py>(&self, packet: PyPacket) -> PyResult<()> {
+        /// This method will await if the connection reached its packet count limit.
+        async fn put(&self, packet: WeakPacket) -> PyResult<()> {
             let packet = packet.into_packet().await;
             let Some(sender) = self.sender() else {
                 return Err(PyRuntimeError::new_err("End is none"));
@@ -344,6 +393,8 @@ pub mod sdk {
     /// Basic node interface.
     #[async_trait]
     pub trait Node: Send {
+        // These two methods returns owned vector because
+        // sometimes a node don't store node ends in a vector.
         fn upstreams(&self) -> Vec<NodeEndToken>;
         fn downstreams(&self) -> Vec<NodeEndToken>;
         async fn run(&mut self) -> Result<Option<Signal>, &'static str>;
@@ -379,8 +430,8 @@ pub mod sdk {
             let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
             let upstream_downstreams = upstream_guard.as_mut().downstreams();
             let downstream_upstreams = downstream_guard.as_mut().upstreams();
-            let (sender1, receiver1) = channel(32);
-            let (sender2, receiver2) = channel(32);
+            let (sender1, receiver1) = channel(PACKET_BUFFER_SIZE);
+            let (sender2, receiver2) = channel(PACKET_BUFFER_SIZE);
             upstream_downstreams[downstream_index].set(sender1, receiver2);
             downstream_upstreams[upstream_index].set(sender2, receiver1);
             Ok(())
@@ -457,25 +508,50 @@ pub mod sdk {
                 }
             }
         }
+        /// Get a COPIED LIST of node upstreams.
+        fn copy_upstreams(&self) -> PyResult<Vec<NodeEndToken>> {
+            match self.node.try_lock().as_mut() {
+                Ok(node) => Ok(node.upstreams()),
+                _ => Err(PyRuntimeError::new_err("Node is running"))
+            }
+        }
+        /// Get a COPIED LIST of node downstreams.
+        fn copy_downstreams(&self) -> PyResult<Vec<NodeEndToken>> {
+            match self.node.try_lock().as_mut() {
+                Ok(node) => Ok(node.downstreams()),
+                _ => Err(PyRuntimeError::new_err("Node is running"))
+            }
+        }
+        /// Get a COPIED LIST of graph nodes.
+        /// 
+        /// Returns `None` if the node is not a graph.
+        fn copy_nodes(&self) -> PyResult<Option<Vec<NodeToken>>> {
+            match self.node.try_lock().as_mut() {
+                Ok(node) => Ok(node.nodes().cloned()),
+                _ => Err(PyRuntimeError::new_err("Node is running"))
+            }
+        }
         /// Spawn tokio runtime and run blocked.
-        pub fn spawn(&mut self) -> PyResult<Option<Signal>> {
+        fn spawn(&mut self) -> PyResult<Option<Signal>> {
             let Ok(rt) = tokio::runtime::Runtime::new() else {
                 return Err(PyRuntimeError::new_err("Cannot spawn tokio runtime"))
             };
-            Ok(rt.block_on(self.run())
-                .map_err(|err| PyRuntimeError::new_err(err))?
-                .map_err(|err| PyRuntimeError::new_err(err))?)
+            rt.block_on(self.run())
+                .map_err(PyRuntimeError::new_err)?
+                .map_err(PyRuntimeError::new_err)
         }
         fn __rshift__(&mut self, other: &mut NodeToken) -> PyResult<NodeToken> {
-            NodeToken::connect_all(self, other).map_err(|err| PyRuntimeError::new_err(err))?;
-            Ok(NodeToken::merge(self, other).map_err(|err| PyRuntimeError::new_err(err))?)
+            NodeToken::connect_all(self, other).map_err(PyRuntimeError::new_err)?;
+            NodeToken::merge(self, other).map_err(PyRuntimeError::new_err)
         }
         fn __add__(&mut self, other: &mut NodeToken) -> PyResult<NodeToken> {
-            Ok(NodeToken::merge(self, other).map_err(|err| PyRuntimeError::new_err(err))?)
+            NodeToken::merge(self, other).map_err(PyRuntimeError::new_err)
         }
     }
 
-    /// A special node supporting hierarchical construction.
+    /// A node supporting hierarchical construction.
+    /// 
+    /// This node is implicitly constructed when two nodes merge.
     #[pyclass]
     pub struct GraphNode {
         pub nodes: Vec<NodeToken>,
@@ -551,14 +627,12 @@ pub mod sdk {
     impl GraphNode {
         #[new]
         #[pyo3(signature = (nodes = None))]
+        #[allow(clippy::new_ret_no_self)]
         pub fn new(nodes: Option<Vec<NodeToken>>) -> NodeToken {
-            let (signal_sender, signal_receiver) = channel(8);
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
             NodeToken {
                 node: Arc::new(Mutex::new(Box::new(Self {
-                    nodes: match nodes {
-                        Some(nodes) => nodes,
-                        None => Vec::new()
-                    },
+                    nodes: nodes.unwrap_or_default(),
                     signal_receiver
                 }))),
                 signal_sender,
@@ -577,8 +651,8 @@ pub mod sdk {
 
     /// Python arg type
     #[derive(IntoPyObject)]
-    enum PyPacketSignalError {
-        PyPacket(PyPacket),
+    enum WeakPacketSignalError {
+        WeakPacket(WeakPacket),
         Signal(Signal),
         Error(())
     }
@@ -598,25 +672,10 @@ pub mod sdk {
         pub callback: Py<PyAny>
     }
 
-    #[pyfunction]
-    fn get_python_node_upstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
-        match node.node.try_lock().as_mut() {
-            Ok(node) => Ok(node.upstreams()),
-            _ => Err(PyRuntimeError::new_err("Node is running"))
-        }
-    }
-
-    #[pyfunction]
-    fn get_python_node_downstreams(node: &NodeToken) -> PyResult<Vec<NodeEndToken>> {
-        match node.node.try_lock().as_mut() {
-            Ok(node) => Ok(node.downstreams()),
-            _ => Err(PyRuntimeError::new_err("Node is running"))
-        }
-    }
-
     #[pymethods]
     impl PythonNode {
         #[new]
+        #[allow(clippy::new_ret_no_self)]
         pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> PyResult<NodeToken> {
             if !callback.is_callable() {
                 return Err(PyValueError::new_err("Callback not callable"));
@@ -625,7 +684,7 @@ pub mod sdk {
             let mut d = Vec::with_capacity(downstreams);
             u.resize_with(upstreams, || NodeEndToken(Arc::new(MutexStd::new(None))));
             d.resize_with(downstreams, || NodeEndToken(Arc::new(MutexStd::new(None))));
-            let (signal_sender, signal_receiver) = channel(8);
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
             Ok(NodeToken {
                 node: Arc::new(Mutex::new(Box::new(Self {
                     upstreams: u,
@@ -649,22 +708,22 @@ pub mod sdk {
         async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
             let mut upstreams: Vec<OwnedMutexGuard<Receiver<Packet>>> = Vec::with_capacity(self.upstreams.len());
             for upstream in &mut self.upstreams {
-                upstreams.push(upstream.receiver()?);
+                upstreams.push(upstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?);
             }
             let mut downstreams: Vec<OwnedMutexGuard<Receiver<Packet>>> = Vec::with_capacity(self.downstreams.len());
             for downstream in &mut self.downstreams {
-                downstreams.push(downstream.receiver()?);
+                downstreams.push(downstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?);
             }
             loop {
                 let ((channel_type, index), outcome) = {
                     let mut tags: Vec<(ChannelType, usize)> = Vec::with_capacity(upstreams.len() + downstreams.len());
-                    let mut packets: Vec<Pin<Box<dyn Future<Output = PyPacketSignalError> + Send + '_>>> = Vec::with_capacity(upstreams.len() + downstreams.len());
+                    let mut packets: Vec<Pin<Box<dyn Future<Output = WeakPacketSignalError> + Send + '_>>> = Vec::with_capacity(upstreams.len() + downstreams.len());
                     for (index, receiver) in upstreams.iter_mut().enumerate() {
                         tags.push((ChannelType::Upstream, index));
                         packets.push(Box::pin(async move {
                             match receiver.recv().await {
-                                Some(packet) => PyPacketSignalError::PyPacket(packet.to_pypacket()),
-                                None => PyPacketSignalError::Error(())
+                                Some(packet) => WeakPacketSignalError::WeakPacket(packet.to_weak_packet()),
+                                None => WeakPacketSignalError::Error(())
                             }
                         }));
                     }
@@ -672,28 +731,28 @@ pub mod sdk {
                         tags.push((ChannelType::Downstream, index));
                         packets.push(Box::pin(async move {
                             match receiver.recv().await {
-                                Some(packet) => PyPacketSignalError::PyPacket(packet.to_pypacket()),
-                                None => PyPacketSignalError::Error(())
+                                Some(packet) => WeakPacketSignalError::WeakPacket(packet.to_weak_packet()),
+                                None => WeakPacketSignalError::Error(())
                             }
                         }));
                     }
                     if packets.is_empty() {
                         match self.signal_receiver.recv().await {
-                            Some(signal) => ((ChannelType::Signal, 0), PyPacketSignalError::Signal(signal)),
+                            Some(signal) => ((ChannelType::Signal, 0), WeakPacketSignalError::Signal(signal)),
                             None => return Err("Signal handle closed")
                         }
                     } else {
                         tokio::select! {
                             biased;
                             signal = self.signal_receiver.recv() => match signal {
-                                Some(signal) => ((ChannelType::Signal, 0), PyPacketSignalError::Signal(signal)),
+                                Some(signal) => ((ChannelType::Signal, 0), WeakPacketSignalError::Signal(signal)),
                                 None => return Err("Signal handle closed")
                             },
                             (outcome, position, _) = select_all(packets) => (tags[position], outcome),
                         }
                     }
                 };
-                if matches!(&outcome, PyPacketSignalError::Error(())) {
+                if matches!(&outcome, WeakPacketSignalError::Error(())) {
                     return Err("End is closed");
                 }
                 let result = Python::attach(|py| {
@@ -712,5 +771,49 @@ pub mod sdk {
             }
         }
     }
+
+    pub struct AbortOnDropHandle<T>(JoinHandle<T>);
+
+    impl<T> AbortOnDropHandle<T> {
+        pub fn new(join_handle: JoinHandle<T>) -> Self {
+            Self(join_handle)
+        }
+        pub fn abort(&self) {
+            self.0.abort();
+        }
+        pub fn is_finished(&self) -> bool {
+            self.0.is_finished()
+        }
+        pub fn abort_handle(&self) -> AbortHandle {
+            self.0.abort_handle()
+        }
+        pub fn detach(self) -> JoinHandle<T> {
+            let me = std::mem::ManuallyDrop::new(self);
+            unsafe { std::ptr::read(&me.0) }
+        }
+    }
+
+    impl<T> Drop for AbortOnDropHandle<T> {
+        fn drop(&mut self) {
+            self.abort();
+        }
+    }
+
+    impl<T> Future for AbortOnDropHandle<T> {
+        type Output = Result<T, tokio::task::JoinError>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Pin::new(&mut self.0).poll(cx)
+        }
+    }
+
+    impl<T> std::ops::Deref for AbortOnDropHandle<T> {
+        type Target = JoinHandle<T>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
 }
 
