@@ -17,3 +17,5 @@ futures.workspace = true
 pyo3.workspace = true
 sdk.path = "../sdk"
 tokio.workspace = true
+simple-dns.workspace = true
+moka.workspace = true

@@ -1,57 +1,45 @@
 #[pyo3::pymodule]
 pub mod sdk {
-    use std::{hash::{Hash, Hasher}, net::IpAddr, pin::Pin, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
+    use std::{collections::HashMap, hash::{Hash, Hasher}, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
     use async_trait::async_trait;
-    use futures::future::select_all;
-    use pyo3::{Borrowed, FromPyObject, IntoPyObject, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
-    use tokio::{sync::{Mutex, OwnedMutexGuard, Semaphore, TryAcquireError, TryLockError, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
+    use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
+    use tokio::{sync::{Mutex, OwnedMutexGuard, Semaphore, TryLockError, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
 
     pub const PACKET_BUFFER_SIZE: usize = 64;
     pub const SIGNAL_BUFFER_SIZE: usize = 8;
+    #[pymodule_export]
     pub const PACKET_DATA_SIZE: usize = 2048;
-    /// Maximum amount of packets a connection can safely buffer.
+    /// Maximum amount of data packets a connection can safely buffer.
     pub const CONNECTION_BUFFER_SIZE: usize = 64;
-
-    /// A python-compatible utility enum with "both" option.
-    #[derive(Copy, Clone)]
-    pub enum AddressMode {
-        V4,
-        V6,
-        V4V6
-    }
-
-    impl<'a, 'py> FromPyObject<'a, 'py> for AddressMode {
-        type Error = PyErr;
-        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-            match obj.cast::<PyString>() {
-                Ok(obj) => match obj.to_str() {
-                    Ok("v4") => Ok(AddressMode::V4),
-                    Ok("v6") => Ok(AddressMode::V6),
-                    Ok("v4v6") => Ok(AddressMode::V4V6),
-                    _ => Err(PyValueError::new_err("Invalid Value"))
-                },
-                _ => Err(PyValueError::new_err("Invalid Value"))
-            }
-        }
-    }
-
-    impl<'py> IntoPyObject<'py> for AddressMode {
-        type Error = PyErr;
-        type Target = PyAny;
-        type Output = Bound<'py, Self::Target>;
-        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-            match self {
-                AddressMode::V4 => Ok(PyString::new(py, "v4").into_any()),
-                AddressMode::V6 => Ok(PyString::new(py, "v6").into_any()),
-                AddressMode::V4V6 => Ok(PyString::new(py, "v4v6").into_any())
-            }
-        }
-    }
 
     #[derive(FromPyObject, IntoPyObject, Clone)]
     pub enum Host {
         Domain(String),
         IpAddr(IpAddr)
+    }
+
+    impl Host {
+        /// Config util for simple blocking system DNS lookup.
+        /// 
+        /// `None` only when the host remains unresolvable domain.
+        pub fn wait_resolve(&mut self) -> Option<IpAddr> {
+            match self {
+                Host::Domain(domain) => match (domain.as_str(), 80).to_socket_addrs() {
+                    Ok(socket_addrs) => {
+                        match socket_addrs.into_iter().next() {
+                            Some(socket_addr) => {
+                                let ip_addr = socket_addr.ip();
+                                *self = Host::IpAddr(ip_addr);
+                                Some(ip_addr)
+                            },
+                            _ => None
+                        }
+                    },
+                    _ => None
+                }
+                Host::IpAddr(ip_addr) => Some(*ip_addr)
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -100,6 +88,10 @@ pub mod sdk {
     /// - For inbound network connection, the host is remote source.
     /// - For outbound network connection, the host is remote destination.
     /// - For proxied connection, the host is the intended proxy destination.
+    /// 
+    /// Notice that this is purely semantic, and is not enforced by any static or runtime measure.
+    /// This is to reduce complexity and enable certain flexible runtime behaviour,
+    /// like directly passing a proxied connection to network endpoint (thus exit).
     #[pyclass(from_py_object, frozen, eq, hash, name="Connection")]
     #[derive(Clone)]
     pub struct ConnectionToken(Arc<Connection>);
@@ -114,19 +106,6 @@ pub mod sdk {
     impl Hash for ConnectionToken {
         fn hash<H: Hasher>(&self, state: &mut H) {
             state.write_usize(self.0.as_ref() as *const Connection as usize);
-        }
-    }
-
-    impl ConnectionToken {
-        async fn acquire(&self) {
-            self.0.buffer.acquire().await.expect("Semaphore was closed").forget();
-        }
-        fn try_acquire(&self) -> Result<(), TryAcquireError> {
-            self.0.buffer.try_acquire()?.forget();
-            Ok(())
-        }
-        fn release(&self) {
-            self.0.buffer.add_permits(1);
         }
     }
 
@@ -180,121 +159,268 @@ pub mod sdk {
         }
     }
 
-    #[derive(Clone)]
-    pub enum Payload {
-        SYN,
-        FIN,
-        Data(Box<[u8]>)
+    pub struct ConnectionAttached {
+        connection: ConnectionToken,
+        pub data: Box<[u8]>
     }
 
-    impl<'a, 'py> FromPyObject<'a, 'py> for Payload {
+    impl Drop for ConnectionAttached {
+        fn drop(&mut self) {
+            self.connection.0.buffer.add_permits(1);
+        }
+    }
+
+    impl ConnectionToken {
+        pub async fn attach(&self, data: Box<[u8]>) -> ConnectionAttached {
+            self.0.buffer.acquire().await.expect("Semaphore was closed").forget();
+            ConnectionAttached {
+                connection: self.clone(),
+                data
+            }
+        }
+        pub fn try_attach(&self, data: Box<[u8]>) -> Result<ConnectionAttached, Box<[u8]>> {
+            match self.0.buffer.try_acquire() {
+                Ok(permit) => {
+                    permit.forget();
+                    Ok(ConnectionAttached {
+                        connection: self.clone(),
+                        data
+                    })
+                },
+                Err(_) => Err(data)
+            }
+        }
+    }
+
+    impl ConnectionAttached {
+        pub fn connection(&self) -> &ConnectionToken {
+            &self.connection
+        }
+        pub fn detach(self) -> ConnectionDetached {
+            let wrapper = std::mem::ManuallyDrop::new(self);
+            wrapper.connection.0.buffer.add_permits(1);
+            ConnectionDetached {
+                connection: unsafe { ptr::read(&wrapper.connection) },
+                data: unsafe { ptr::read(&wrapper.data) }
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct ConnectionDetached {
+        pub connection: ConnectionToken,
+        pub data: Box<[u8]>
+    }
+
+    impl ConnectionDetached {
+        pub fn new(connection: ConnectionToken, data: Box<[u8]>) -> Self {
+            Self {
+                connection,
+                data
+            }
+        }
+        pub async fn attach(self) -> ConnectionAttached {
+            self.connection.0.buffer.acquire().await.expect("Semaphore was closed").forget();
+            ConnectionAttached {
+                connection: self.connection,
+                data: self.data
+            }
+        }
+        pub fn try_attach(self) -> Result<ConnectionAttached, Self> {
+            let result = {
+                match self.connection.0.buffer.try_acquire() {
+                    Ok(permit) => {
+                        permit.forget();
+                        true
+                    },
+                    Err(_) => false
+                }
+            };
+            match result {
+                true => Ok(ConnectionAttached {
+                    connection: self.connection,
+                    data: self.data
+                }),
+                false => Err(self)
+            }
+        }
+    }
+
+    pub enum Packet {
+        Syn(ConnectionToken),
+        Data(ConnectionAttached),
+        Fin(ConnectionToken)
+    }
+
+    impl Packet {
+        pub fn detach(self) -> DetachedPacket {
+            match self {
+                Packet::Syn(connection) => DetachedPacket::Syn(connection),
+                Packet::Data(attached) => DetachedPacket::Data(attached.detach()),
+                Packet::Fin(connection) => DetachedPacket::Fin(connection)
+            }
+        }
+        pub fn clone_detached(&self) -> DetachedPacket {
+            match self {
+                Packet::Syn(connection) => DetachedPacket::Syn(connection.clone()),
+                Packet::Data(attached) => DetachedPacket::Data(ConnectionDetached {
+                    connection: attached.connection().clone(),
+                    data: attached.data.clone()
+                }),
+                Packet::Fin(connection) => DetachedPacket::Fin(connection.clone())
+            }
+        }
+        pub fn connection(&self) -> &ConnectionToken {
+            match self {
+                Packet::Syn(token) => token,
+                Packet::Data(attached) => attached.connection(),
+                Packet::Fin(token) => token
+            }
+        }
+        pub fn is_syn(&self) -> bool {
+            matches!(self, Self::Syn(_))
+        }
+        pub fn is_data(&self) -> bool {
+            matches!(self, Self::Data(_))
+        }
+        pub fn is_fin(&self) -> bool {
+            matches!(self, Self::Fin(_))
+        }
+    }
+
+    #[derive(Clone)]
+    pub enum DetachedPacket {
+        Syn(ConnectionToken),
+        Data(ConnectionDetached),
+        Fin(ConnectionToken)
+    }
+
+    impl DetachedPacket {
+        pub async fn attach(self) -> Packet {
+            match self {
+                Self::Syn(connection) => Packet::Syn(connection),
+                Self::Data(detached) => Packet::Data(detached.attach().await),
+                Self::Fin(connection) => Packet::Fin(connection)
+            }
+        }
+        pub fn try_attach(self) -> Result<Packet, Self> {
+            match self {
+                Self::Syn(connection) => Ok(Packet::Syn(connection)),
+                Self::Data(detached) => match detached.try_attach() {
+                    Ok(attached) => Ok(Packet::Data(attached)),
+                    Err(detached) => Err(Self::Data(detached))
+                },
+                Self::Fin(connection) => Ok(Packet::Fin(connection))
+            }
+        }
+        pub fn connection(&self) -> &ConnectionToken {
+            match self {
+                DetachedPacket::Syn(token) => token,
+                DetachedPacket::Data(attached) => &attached.connection,
+                DetachedPacket::Fin(token) => token
+            }
+        }
+        pub fn is_syn(&self) -> bool {
+            matches!(self, Self::Syn(_))
+        }
+        pub fn is_data(&self) -> bool {
+            matches!(self, Self::Data(_))
+        }
+        pub fn is_fin(&self) -> bool {
+            matches!(self, Self::Fin(_))
+        }
+    }
+
+    impl<'a, 'py> FromPyObject<'a, 'py> for DetachedPacket {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            match obj.extract::<PyPacket>() {
+                Ok(obj) => match obj.payload {
+                    PyPayload::Syn => Ok(DetachedPacket::Syn(obj.connection)),
+                    PyPayload::Data(data) => Ok(DetachedPacket::Data(ConnectionDetached { connection: obj.connection, data })),
+                    PyPayload::Fin => Ok(DetachedPacket::Fin(obj.connection))
+                },
+                _ => Err(PyValueError::new_err("Invalid packet"))
+            }
+        }
+    }
+
+    impl<'py> IntoPyObject<'py> for DetachedPacket {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            let py_packet = match self {
+                Self::Syn(connection) => PyPacket {
+                    connection,
+                    payload: PyPayload::Syn
+                },
+                Self::Data(detached) => PyPacket {
+                    connection: detached.connection,
+                    payload: PyPayload::Data(detached.data)
+                },
+                Self::Fin(connection) => PyPacket {
+                    connection,
+                    payload: PyPayload::Fin
+                }
+            };
+            py_packet.into_bound_py_any(py)
+        }
+    }
+
+    /// Internal python payload type, as native `"Syn" | "Fin" | bytes`.
+    /// 
+    /// This type already checks `PACKET_DATA_SIZE` on boundary.
+    #[derive(Clone)]
+    enum PyPayload {
+        Syn,
+        Data(Box<[u8]>),
+        Fin
+    }
+
+    impl<'a, 'py> FromPyObject<'a, 'py> for PyPayload {
         type Error = PyErr;
         fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
             if let Ok(obj) = obj.cast::<PyString>() {
-                match obj.to_str() {
-                    Ok("SYN") => return Ok(Payload::SYN),
-                    Ok("FIN") => return Ok(Payload::FIN),
-                    _ => return Err(PyValueError::new_err("Invalid Value"))
-                };
+                return match obj.to_str() {
+                    Ok("Syn") => Ok(Self::Syn),
+                    Ok("Fin") => Ok(Self::Fin),
+                    _ => Err(PyValueError::new_err("Invalid flag string. Did you mean bytes?"))
+                }
             };
             match obj.cast::<PyBytes>() {
-                Ok(obj) => Ok(Payload::Data(Box::from(obj.as_bytes()))),
+                Ok(obj) => {
+                    if obj.len().expect("bytes object has no len") > PACKET_DATA_SIZE {
+                        return Err(PyValueError::new_err(format!("Packet payload too long. Maximum {} bytes.", PACKET_DATA_SIZE)));
+                    };
+                    Ok(Self::Data(Box::from(obj.as_bytes())))
+                },
                 _ => Err(PyValueError::new_err("Invalid Value"))
             }
         }
     }
 
-    impl<'py> IntoPyObject<'py> for Payload {
+    impl<'py> IntoPyObject<'py> for PyPayload {
         type Error = PyErr;
         type Target = PyAny;
         type Output = Bound<'py, Self::Target>;
         fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
             match self {
-                Payload::SYN => Ok(PyString::new(py, "SYN").into_any()),
-                Payload::FIN => Ok(PyString::new(py, "FIN").into_any()),
-                Payload::Data(obj) => Ok(PyBytes::new(py, &obj).into_any())
+                Self::Syn => Ok(PyString::new(py, "Syn").into_any()),
+                Self::Fin => Ok(PyString::new(py, "Fin").into_any()),
+                Self::Data(data) => Ok(PyBytes::new(py, &data).into_any())
             }
         }
     }
 
-    /// General representation of a packet.
-    /// 
-    /// The amount of packet a connection can safely buffer is limited; 
-    /// When existing Packets reaches this limit, new construction must wait for drop.
-    pub struct Packet {
-        connection: ConnectionToken,
-        pub payload: Payload
-    }
-
-    impl Drop for Packet {
-        fn drop(&mut self) {
-            self.connection.release();
-        }
-    }
-
-    impl Packet {
-        /// Awaits `drop` if the connection reached packet count limit.
-        pub async fn new(connection: ConnectionToken, payload: Payload) -> Self {
-            connection.acquire().await;
-            Self {
-                connection,
-                payload
-            }
-        }
-        /// Fails if the connection reached packet count limit.
-        pub fn try_new(connection: ConnectionToken, payload: Payload) -> Result<Self, TryAcquireError> {
-            connection.try_acquire()?;
-            Ok(Self {
-                connection,
-                payload
-            })
-        }
-        /// Get the connection of the packet.
-        /// 
-        /// The connection of a counted packet is immutable.
-        pub fn connection(&self) -> &ConnectionToken {
-            &self.connection
-        }
-        pub fn to_weak_packet(&self) -> WeakPacket {
-            WeakPacket {
-                connection: self.connection.clone(),
-                payload: self.payload.clone()
-            }
-        }
-    }
-
-    /// Note: The reference to the connection is strong. This packet is weak
-    /// in terms of escaping connection packet buffer limit.
-    /// 
-    /// A weak packet can be simply constructed, but it cannot be accepted in most
-    /// packet buffers.
-    #[pyclass(name="Packet", from_py_object)]
+    /// Python closure of `DetachedPacket`.
+    #[pyclass(from_py_object, name="Packet")]
     #[derive(Clone)]
-    pub struct WeakPacket {
+    struct PyPacket {
+        #[pyo3(get, set)]
         connection: ConnectionToken,
-        payload: Payload
-    }
-
-    impl WeakPacket {
-        /// Awaits `drop` if the connection reached packet count limit.
-        pub async fn into_packet(self) -> Packet {
-            Packet::new(self.connection, self.payload).await
-        }
-        /// Fails if the connection reached packet count limit.
-        pub fn try_into_packet(self) -> Result<Packet, TryAcquireError> {
-            Packet::try_new(self.connection.clone(), self.payload.clone())
-        }
-    }
-
-    #[pymethods]
-    impl WeakPacket {
-        #[new]
-        fn new(connection: ConnectionToken, payload: Payload) -> Self {
-            Self {
-                connection,
-                payload
-            }
-        }
+        #[pyo3(get, set)]
+        payload: PyPayload
     }
 
     /// Unidirectional control message with high scheduling priority.
@@ -314,6 +440,17 @@ pub mod sdk {
         /// 
         /// Unrecognized signals are simply discarded.
         SIGUSR2
+    }
+
+    pub trait Drain {
+        fn drain(&mut self);
+    }
+
+    impl Drain for Receiver<Signal> {
+        /// Does what you think
+        fn drain(&mut self) {
+            while self.try_recv().is_ok() {}
+        }
     }
 
     struct NodeEnd {
@@ -359,9 +496,12 @@ pub mod sdk {
         pub fn is_none(&self) -> bool {
             self.0.lock().expect("End is poisoned").is_none()
         }
-        /// This method will fail if the connection reached its packet count limit.
-        fn put_nowait(&self, packet: WeakPacket) -> PyResult<()> {
-            let Ok(packet) = packet.try_into_packet() else {
+        pub fn is_some(&self) -> bool {
+            self.0.lock().expect("End is poisoned").is_some()
+        }
+        /// This method will fail if the connection reached its data packet count limit.
+        fn put_nowait(&self, packet: DetachedPacket) -> PyResult<()> {
+            let Ok(packet) = packet.try_attach() else {
                 return Err(PyBufferError::new_err("Cannot create new packet"))
             };
             let Some(sender) = self.sender() else {
@@ -377,9 +517,9 @@ pub mod sdk {
                 }
             }
         }
-        /// This method will await if the connection reached its packet count limit.
-        async fn put(&self, packet: WeakPacket) -> PyResult<()> {
-            let packet = packet.into_packet().await;
+        /// This method will await if the connection reached its data packet count limit.
+        async fn put(&self, packet: DetachedPacket) -> PyResult<()> {
+            let packet = packet.attach().await;
             let Some(sender) = self.sender() else {
                 return Err(PyRuntimeError::new_err("End is none"));
             };
@@ -502,10 +642,9 @@ pub mod sdk {
         pub fn signal(&self, signal: Signal) -> PyResult<()> {
             match self.signal_sender.try_send(signal){
                 Ok(()) => Ok(()),
-                Err(err) => match err {
-                    TrySendError::Closed(_) => Err(PyRuntimeError::new_err("Signal receiver is closed")),
-                    TrySendError::Full(_) => Err(PyRuntimeError::new_err("Signal receiver is full"))
-                }
+                Err(TrySendError::Closed(_)) => Err(PyRuntimeError::new_err("Signal receiver is closed")),
+                Err(TrySendError::Full(_)) => Err(PyRuntimeError::new_err("Signal receiver is full"))
+                
             }
         }
         /// Get a COPIED LIST of node upstreams.
@@ -579,7 +718,7 @@ pub mod sdk {
             downstreams
         }
         async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            while self.signal_receiver.try_recv().is_ok() {}
+            self.signal_receiver.drain();
             for token in &self.nodes {
                 if token.node.try_lock().is_err() {
                     return Err("Node is already running");
@@ -639,135 +778,42 @@ pub mod sdk {
             }
         }
     }
-
-    /// Python arg type
-    #[pyclass(skip_from_py_object)]
-    #[derive(Clone, Copy)]
-    enum ChannelType {
-        Signal,
-        Upstream,
-        Downstream
+    
+    /// A python-compatible utility enum with "both" option.
+    #[derive(Copy, Clone)]
+    pub enum AddressMode {
+        V4,
+        V6,
+        V4V6,
+        V6V4
     }
 
-    /// Python arg type
-    #[derive(IntoPyObject)]
-    enum WeakPacketSignalError {
-        WeakPacket(WeakPacket),
-        Signal(Signal),
-        Error(())
-    }
-
-    /// Python return type
-    #[derive(FromPyObject)]
-    enum PythonCallbackReturnCode {
-        Control(bool),
-        Signal(Signal)
-    }
-
-    #[pyclass]
-    pub struct PythonNode {
-        pub upstreams: Vec<NodeEndToken>,
-        pub downstreams: Vec<NodeEndToken>,
-        pub signal_receiver: Receiver<Signal>,
-        pub callback: Py<PyAny>
-    }
-
-    #[pymethods]
-    impl PythonNode {
-        #[new]
-        #[allow(clippy::new_ret_no_self)]
-        pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> PyResult<NodeToken> {
-            if !callback.is_callable() {
-                return Err(PyValueError::new_err("Callback not callable"));
+    impl<'a, 'py> FromPyObject<'a, 'py> for AddressMode {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            match obj.cast::<PyString>() {
+                Ok(obj) => match obj.to_str() {
+                    Ok("V4") => Ok(AddressMode::V4),
+                    Ok("V6") => Ok(AddressMode::V6),
+                    Ok("V4V6") => Ok(AddressMode::V4V6),
+                    Ok("V6V4") => Ok(AddressMode::V6V4),
+                    _ => Err(PyValueError::new_err("Invalid Value"))
+                },
+                _ => Err(PyValueError::new_err("Invalid Value"))
             }
-            let mut u = Vec::with_capacity(upstreams);
-            let mut d = Vec::with_capacity(downstreams);
-            u.resize_with(upstreams, || NodeEndToken(Arc::new(MutexStd::new(None))));
-            d.resize_with(downstreams, || NodeEndToken(Arc::new(MutexStd::new(None))));
-            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            Ok(NodeToken {
-                node: Arc::new(Mutex::new(Box::new(Self {
-                    upstreams: u,
-                    downstreams: d,
-                    signal_receiver,
-                    callback: callback.unbind()
-                }))),
-                signal_sender
-            })
         }
     }
 
-    #[async_trait]
-    impl Node for PythonNode {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
-            self.upstreams.clone()
-        }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
-            self.downstreams.clone()
-        }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            let mut upstreams: Vec<OwnedMutexGuard<Receiver<Packet>>> = Vec::with_capacity(self.upstreams.len());
-            for upstream in &mut self.upstreams {
-                upstreams.push(upstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?);
-            }
-            let mut downstreams: Vec<OwnedMutexGuard<Receiver<Packet>>> = Vec::with_capacity(self.downstreams.len());
-            for downstream in &mut self.downstreams {
-                downstreams.push(downstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?);
-            }
-            loop {
-                let ((channel_type, index), outcome) = {
-                    let mut tags: Vec<(ChannelType, usize)> = Vec::with_capacity(upstreams.len() + downstreams.len());
-                    let mut packets: Vec<Pin<Box<dyn Future<Output = WeakPacketSignalError> + Send + '_>>> = Vec::with_capacity(upstreams.len() + downstreams.len());
-                    for (index, receiver) in upstreams.iter_mut().enumerate() {
-                        tags.push((ChannelType::Upstream, index));
-                        packets.push(Box::pin(async move {
-                            match receiver.recv().await {
-                                Some(packet) => WeakPacketSignalError::WeakPacket(packet.to_weak_packet()),
-                                None => WeakPacketSignalError::Error(())
-                            }
-                        }));
-                    }
-                    for (index, receiver) in downstreams.iter_mut().enumerate() {
-                        tags.push((ChannelType::Downstream, index));
-                        packets.push(Box::pin(async move {
-                            match receiver.recv().await {
-                                Some(packet) => WeakPacketSignalError::WeakPacket(packet.to_weak_packet()),
-                                None => WeakPacketSignalError::Error(())
-                            }
-                        }));
-                    }
-                    if packets.is_empty() {
-                        match self.signal_receiver.recv().await {
-                            Some(signal) => ((ChannelType::Signal, 0), WeakPacketSignalError::Signal(signal)),
-                            None => return Err("Signal handle closed")
-                        }
-                    } else {
-                        tokio::select! {
-                            biased;
-                            signal = self.signal_receiver.recv() => match signal {
-                                Some(signal) => ((ChannelType::Signal, 0), WeakPacketSignalError::Signal(signal)),
-                                None => return Err("Signal handle closed")
-                            },
-                            (outcome, position, _) = select_all(packets) => (tags[position], outcome),
-                        }
-                    }
-                };
-                if matches!(&outcome, WeakPacketSignalError::Error(())) {
-                    return Err("End is closed");
-                }
-                let result = Python::attach(|py| {
-                    let channel_type = Py::new(py, channel_type)?;
-                    let object = self.callback.call1(py, (channel_type, index, outcome))?;
-                    object.bind(py).extract::<PythonCallbackReturnCode>()
-                });
-                match result {
-                    Ok(PythonCallbackReturnCode::Control(control)) => match control {
-                        false => continue,
-                        true => return Ok(None)
-                    },
-                    Ok(PythonCallbackReturnCode::Signal(signal)) => return Ok(Some(signal)),
-                    Err(_) => return Ok(Some(Signal::SIGTERM)),
-                }
+    impl<'py> IntoPyObject<'py> for AddressMode {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            match self {
+                AddressMode::V4 => Ok(PyString::new(py, "V4").into_any()),
+                AddressMode::V6 => Ok(PyString::new(py, "V6").into_any()),
+                AddressMode::V4V6 => Ok(PyString::new(py, "V4V6").into_any()),
+                AddressMode::V6V4 => Ok(PyString::new(py, "V6V4").into_any())
             }
         }
     }
@@ -815,5 +861,118 @@ pub mod sdk {
         }
     }
 
+    pub struct Bijection<X: Eq + Hash + Clone, Y: Eq + Hash + Clone> {
+        x: HashMap<X, Y>,
+        y: HashMap<Y, X>
+    }
+
+    impl<X: Eq + Hash + Clone, Y: Eq + Hash + Clone> Default for Bijection<X, Y> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<X: Eq + Hash + Clone, Y: Eq + Hash + Clone> Bijection<X, Y> {
+        pub fn new() -> Self {
+            Self {
+                x: HashMap::new(),
+                y: HashMap::new()
+            }
+        }
+        /// Set `x <-> y` relation.
+        /// 
+        /// Removes existing relations involving `x` and `y`.
+        pub fn set(&mut self, x: X, y: Y) {
+            if let Some(prior_y) = self.x.remove(&x) {
+                self.y.remove(&prior_y);
+            };
+            if let Some(prior_x) = self.y.remove(&y) {
+                self.x.remove(&prior_x);
+            };
+            self.x.insert(x.clone(), y.clone());
+            self.y.insert(y, x);
+        }
+        pub fn x_get(&self, x: &X) -> Option<Y> {
+            self.x.get(x).cloned()
+        }
+        pub fn y_get(&self, y: &Y) -> Option<X> {
+            self.y.get(y).cloned()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.x.is_empty()
+        }
+        pub fn x_remove(&mut self, x: &X) -> Option<Y> {
+            let y = self.x.remove(x);
+            if let Some(y) = &y {
+                self.y.remove(y);
+            }
+            y
+        }
+        pub fn y_remove(&mut self, y: &Y) -> Option<X> {
+            let x = self.y.remove(y);
+            if let Some(x) = &x {
+                self.x.remove(x);
+            }
+            x
+        }
+    }
+
+    pub struct BijectionAD<X: Eq + Hash + Clone, Y: Eq + Hash + Clone, D: Clone> {
+        x: HashMap<X, (Y, D)>,
+        y: HashMap<Y, (X, D)>
+    }
+
+    impl<X: Eq + Hash + Clone, Y: Eq + Hash + Clone, D: Clone> Default for BijectionAD<X, Y, D> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<X: Eq + Hash + Clone, Y: Eq + Hash + Clone, D: Clone> BijectionAD<X, Y, D> {
+        pub fn new() -> Self {
+            Self {
+                x: HashMap::new(),
+                y: HashMap::new()
+            }
+        }
+        /// Set `x <-d-> y` relation.
+        /// 
+        /// Removes existing relations involving `x` and `y`.
+        pub fn set(&mut self, x: X, y: Y, d: D) {
+            if let Some((prior_y, _)) = self.x.remove(&x) {
+                self.y.remove(&prior_y);
+            };
+            if let Some((prior_x, _)) = self.y.remove(&y) {
+                self.x.remove(&prior_x);
+            };
+            self.x.insert(x.clone(), (y.clone(), d.clone()));
+            self.y.insert(y, (x, d));
+        }
+        pub fn x_get(&self, x: &X) -> Option<(Y, D)> {
+            self.x.get(x).cloned()
+        }
+        pub fn y_get(&self, y: &Y) -> Option<(X, D)> {
+            self.y.get(y).cloned()
+        }
+        pub fn is_empty(&self) -> bool {
+            self.x.is_empty()
+        }
+        /// Idempotently remove the relation involving `x`.
+        pub fn x_remove(&mut self, x: &X) -> Option<(Y, D)> {
+            let removed = self.x.remove(x);
+            if let Some((y, _)) = &removed {
+                self.y.remove(y);
+            }
+            removed
+        }
+        /// Idempotently remove the relation involving `y`.
+        pub fn y_remove(&mut self, y: &Y) -> Option<(X, D)> {
+            let removed = self.y.remove(y);
+            if let Some((x, _)) = &removed {
+                self.x.remove(x);
+            }
+            removed
+        }
+    }
 }
 
