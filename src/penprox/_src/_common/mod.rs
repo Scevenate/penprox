@@ -30,6 +30,7 @@ pub mod common {
     /// 
     /// Therefore, such buffer is guaranteed to be available if the sender is
     /// aware of illegal packets (other than one `Fin`).
+    #[tracing::instrument(skip_all)]
     async fn tcp_handler(
         stream: Option<TcpStream>,
         connection: ConnectionToken,
@@ -38,17 +39,32 @@ pub mod common {
     ) -> (ConnectionToken, Option<Signal>) {
         let announce = stream.is_some();
         let stream = match stream {
-            Some(stream) => stream,
+            Some(stream) => {
+                tracing::debug!("Accepted new upstream connection");
+                stream
+            },
             None => {
                 let Host::IpAddr(ip_addr) = connection.host() else {
+                    tracing::debug!("Host is not resolved");
                     if sender.send(Packet::Fin(connection.clone())).await.is_err() {
                         return (connection, Some(Signal::SIGTERM));
                     }
                     return (connection, None);
                 };
                 match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip_addr, connection.port()))).await {
-                    Ok(Ok(stream)) => stream,
+                    Ok(Ok(stream)) => {
+                        tracing::debug!("Established new downstream connection");
+                        stream
+                    },
+                    Ok(Err(error)) => {
+                        tracing::debug!("Cannot connect to remote host: {error}");
+                        if sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                            return (connection, Some(Signal::SIGTERM));
+                        };
+                        return (connection, None);
+                    },
                     _ => {
+                        tracing::debug!("Cannot connect to remote host (timeout)");
                         if sender.send(Packet::Fin(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
@@ -70,14 +86,19 @@ pub mod common {
             while let Some(packet) = receiver.recv().await {
                 match packet {
                     Packet::Syn(connection) => {
+                        tracing::debug!("Received invalid SYN packet");
                         if writer_sender.send(Packet::Fin(connection)).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
                         return None;
                     }
-                    Packet::Fin(_) => return None,
+                    Packet::Fin(_) => {
+                        tracing::debug!("Connection closed (FIN)");
+                        return None
+                    },
                     Packet::Data(attached) => {
                         if !matches!(tokio::time::timeout(TCP_TIMEOUT, writer.write_all(&attached.data)).await, Ok(Ok(()))) { // ConnectionAttached is not dropped yet
+                            tracing::debug!("Connection timed out");
                             if writer_sender.send(Packet::Fin(writer_connection)).await.is_err() {
                                 return Some(Signal::SIGTERM);
                             }
@@ -97,6 +118,7 @@ pub mod common {
                 },
                 read = tokio::time::timeout(TCP_TIMEOUT, reader.read(&mut buffer)) => match read {
                     Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+                        tracing::debug!("Remote is irresponsive");
                         if sender.send(Packet::Fin(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
@@ -123,6 +145,7 @@ pub mod common {
     /// When provided `None`, the node is in downstream mode:
     /// - It has one upstream, no downstream.
     #[pyclass]
+    #[derive(Debug)]
     pub struct TCPNode {
         node_end: NodeEndToken,
         signal_receiver: Receiver<Signal>,
@@ -149,26 +172,33 @@ pub mod common {
 
     #[async_trait]
     impl Node for TCPNode {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.address {
-                Some(_) => Vec::new(),
-                None => vec![self.node_end.clone()]
+                Some(_) => Ok(Vec::new()),
+                None => Ok(vec![self.node_end.clone()])
             }
         }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.address {
-                Some(_) => vec![self.node_end.clone()],
-                None => Vec::new()
+                Some(_) => Ok(vec![self.node_end.clone()]),
+                None => Ok(Vec::new())
             }
         }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            let sender = self.node_end.sender().ok_or("Node is improperly connected")?;
-            let mut receiver = self.node_end.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
+        #[tracing::instrument(name="TCPNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let sender = self.node_end.sender().map_err(GraphError::from)?;
+            let mut receiver = self.node_end.receiver().map_err(GraphError::from)?;
             self.signal_receiver.drain();
             match self.address {
                 Some(address) => { // TCPNode: upstream mode
-                    let listener = TcpListener::bind(address).await.map_err(|_| "Cannot bind address")?;
-                    self.address = Some(listener.local_addr().map_err(|_| "Cannot get address")?);
+                    let listener = TcpListener::bind(address).await.map_err(|error| {
+                        tracing::error!("Cannot bind address: {error}");
+                        GraphError::NodeError
+                    })?;
+                    self.address = Some(listener.local_addr().map_err(|error| {
+                        tracing::error!("Cannot get address: {error}");
+                        GraphError::NodeError
+                    })?);
                     #[allow(clippy::mutable_key_type)]
                     let mut dispatch: HashMap<ConnectionToken, Sender<Packet>> = HashMap::new();
                     let mut handlers: JoinSet<(ConnectionToken, Option<Signal>)> = JoinSet::new(); // This cancels on drop
@@ -177,15 +207,22 @@ pub mod common {
                             biased;
                             signal = self.signal_receiver.recv() => match signal {
                                 Some(Signal::SIGTERM) => return Ok(None),
-                                None => return Err("Signal receiver is closed"),
+                                None => {
+                                    tracing::error!("Signal receiver is closed");
+                                    return Err(GraphError::Disconnected)
+                                },
                                 _ => continue
                             },
                             handler = handlers.join_next(), if !handlers.is_empty() => match handler {
                                 None => unreachable!("Awaiting non-empty join set that is empty"),
-                                Some(Err(_)) => continue,
+                                Some(Err(error)) => {
+                                    tracing::warn!("Node handler task failed: {error}");
+                                    continue;
+                                }
                                 Some(Ok((connection, signal))) => {
                                     dispatch.remove(&connection);
                                     if let Some(signal) = signal {
+                                        tracing::debug!("Connection {:?} removed with signal {:?}, return & propagate", connection, signal);
                                         return Ok(Some(signal));
                                     }
                                     continue;
@@ -197,7 +234,10 @@ pub mod common {
                                         let _ = handler.send(packet).await; // No good countermeasure for this never condition
                                     }
                                 },
-                                None => return Ok(None)
+                                None => {
+                                    tracing::error!("Downstream closed");
+                                    return Err(GraphError::Disconnected);
+                                }
                             },
                             accepted = listener.accept() => match accepted {
                                 Ok((stream, peer)) => {
@@ -211,7 +251,10 @@ pub mod common {
                                         dispatch_receiver
                                     ));
                                 },
-                                _ => continue
+                                Err(error) => {
+                                    tracing::warn!("TCP accept failed: {error}");
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -225,12 +268,18 @@ pub mod common {
                             biased;
                             signal = self.signal_receiver.recv() => match signal {
                                 Some(Signal::SIGTERM) => return Ok(None),
-                                None => return Err("Signal receiver is closed"),
+                                None => {
+                                    tracing::error!("Signal receiver is closed");
+                                    return Err(GraphError::Disconnected)
+                                },
                                 _ => continue
                             },
                             handler = handlers.join_next(), if !handlers.is_empty() => match handler {
                                 None => unreachable!("Awaiting non-empty join set that is empty"),
-                                Some(Err(_)) => continue,
+                                Some(Err(error)) => {
+                                    tracing::warn!("Node handler task failed: {error}");
+                                    continue;
+                                }
                                 Some(Ok((connection, signal))) => {
                                     dispatch.remove(&connection);
                                     if let Some(signal) = signal {
@@ -244,10 +293,11 @@ pub mod common {
                                     match packet {
                                         Packet::Syn(connection) => {
                                             if dispatch.contains_key(&connection) {
+                                                tracing::debug!("Received SYN for existing connection {:?}, closing", connection);
                                                 let handler = dispatch.remove(&connection).expect("Unwrapping None that is some");
                                                 let _ = handler.send(Packet::Fin(connection.clone())).await;
                                                 if sender.send(Packet::Fin(connection)).await.is_err() {
-                                                    return Err("End closed");
+                                                    { tracing::error!("End closed"); return Err(GraphError::Disconnected) };
                                                 };
                                                 continue;
                                             }
@@ -260,8 +310,11 @@ pub mod common {
                                                 Some(handler) => {
                                                     let _ = handler.send(Packet::Data(attached)).await;
                                                 },
-                                                None => if sender.send(Packet::Fin(attached.connection().clone())).await.is_err() {
-                                                    return Err("End closed");
+                                                None => {
+                                                    if sender.send(Packet::Fin(attached.connection().clone())).await.is_err() {
+                                                        tracing::error!("updstream closed");
+                                                        return Err(GraphError::Disconnected)
+                                                    };
                                                 }
                                             };
                                         },
@@ -284,7 +337,7 @@ pub mod common {
         }
     }
 
-    #[derive(Clone, Copy, FromPyObject)]
+    #[derive(Clone, Copy, FromPyObject, Debug)]
     pub enum UDPNodeMode {
         Upstream(IpAddr, u16),
         Downstream(AddressMode)
@@ -301,6 +354,7 @@ pub mod common {
     /// - It binds ephemeral v4 | v6 | v4&v6 port(s). (`V4V6` and `V6V4` are treated the same here).
     /// - It has one upstream, no downstream.
     #[pyclass]
+    #[derive(Debug)]
     pub struct UDPNode {
         node_end: NodeEndToken,
         signal_receiver: Receiver<Signal>,
@@ -327,26 +381,30 @@ pub mod common {
 
     #[async_trait]
     impl Node for UDPNode {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.mode {
-                UDPNodeMode::Upstream(_, _) => Vec::new(),
-                UDPNodeMode::Downstream(_) => vec![self.node_end.clone()]
+                UDPNodeMode::Upstream(_, _) => Ok(Vec::new()),
+                UDPNodeMode::Downstream(_) => Ok(vec![self.node_end.clone()])
             }
         }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.mode {
-                UDPNodeMode::Upstream(_, _) => vec![self.node_end.clone()],
-                UDPNodeMode::Downstream(_) => Vec::new()
+                UDPNodeMode::Upstream(_, _) => Ok(vec![self.node_end.clone()]),
+                UDPNodeMode::Downstream(_) => Ok(Vec::new())
             }
         }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            let sender = self.node_end.sender().ok_or("Node is improperly connected")?;
-            let mut receiver = self.node_end.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
+        #[tracing::instrument(name="UDPNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let sender = self.node_end.sender().map_err(GraphError::from)?;
+            let mut receiver = self.node_end.receiver().map_err(GraphError::from)?;
             self.signal_receiver.drain();
             let mode = self.mode;
             let (socket_v4, socket_v6) = match mode {
                 UDPNodeMode::Upstream(host, port) => {
-                    let socket = UdpSocket::bind(SocketAddr::new(host, port)).await.map_err(|_| "Cannot bind address")?;
+                    let socket = UdpSocket::bind(SocketAddr::new(host, port)).await.map_err(|error| {
+                        tracing::error!("Cannot bind address: {error}");
+                        GraphError::NodeError
+                    })?;
                     match host {
                         IpAddr::V4(_) => (Some(socket), None),
                         IpAddr::V6(_) => (None, Some(socket))
@@ -355,12 +413,18 @@ pub mod common {
                 UDPNodeMode::Downstream(address_mode) => {
                     let socket_v4 = match address_mode {
                         AddressMode::V6 => None,
-                        _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await.map_err(|_| "Cannot bind ipv4 address")?),
+                        _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await.map_err(|error| {
+                            tracing::error!("Cannot bind ipv4 address: {error}");
+                            GraphError::NodeError
+                        })?),
                         
                     };
                     let socket_v6 = match address_mode {
                         AddressMode::V4 => None,
-                        _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).await.map_err(|_| "Cannot bind ipv6 address")?),
+                        _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).await.map_err(|error| {
+                            tracing::error!("Cannot bind ipv6 address: {error}");
+                            GraphError::NodeError
+                        })?),
                     };
                     (socket_v4, socket_v6)
                 }
@@ -374,20 +438,25 @@ pub mod common {
                     biased;
                     signal = self.signal_receiver.recv() => match signal {
                         Some(Signal::SIGTERM) => return Ok(None),
-                        None => return Err("Signal receiver is closed"),
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
                         _ => continue
                     },
                     packet = receiver.recv() => match packet {
                         Some(Packet::Syn(connection)) => {
                             if matches!(mode, UDPNodeMode::Upstream(..)) {
                                 if sender.send(Packet::Fin(connection)).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 };
                                 continue;
                             }
                             match connection.host() {
                                 Host::Domain(_) => if sender.send(Packet::Fin(connection)).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 },
                                 Host::IpAddr(ip_addr) => { connections.insert(SocketAddr::new(ip_addr, connection.port()), (connection, Instant::now() + UDP_TIMEOUT)); }
                             };
@@ -400,7 +469,8 @@ pub mod common {
                         Some(Packet::Data(attached)) => {
                             match attached.connection().host() {
                                 Host::Domain(_) => if sender.send(Packet::Fin(attached.connection().clone())).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 },
                                 Host::IpAddr(ip_addr) => {
                                     let socket = match ip_addr {
@@ -408,7 +478,10 @@ pub mod common {
                                         IpAddr::V6(_) => socket_v6.as_ref()
                                     };
                                     if let Some(socket) = socket {
-                                        socket.send_to(&attached.data[..], SocketAddr::new(ip_addr, attached.connection().port())).await.map_err(|_| "UDP socket closed")?;
+                                        socket.send_to(&attached.data[..], SocketAddr::new(ip_addr, attached.connection().port())).await.map_err(|error| {
+                                            tracing::error!("UDP socket closed: {error}");
+                                            GraphError::NodeError
+                                        })?;
                                     };
                                     if let Some((_, deadline)) = connections.get_mut(&SocketAddr::new(ip_addr, attached.connection().port())) {
                                         *deadline = Instant::now() + UDP_TIMEOUT;
@@ -421,7 +494,10 @@ pub mod common {
                     accepted_v4 = socket_v4.as_ref().expect("Unwrapping None which is Some").recv_from(&mut buffer_v4), if socket_v4.is_some() => {
                         let (count, peer) = match accepted_v4 {
                             Ok(result) => result,
-                            _ => return Ok(Some(Signal::SIGTERM))
+                            Err(error) => {
+                                tracing::error!("UDP receive failed: {error}");
+                                return Ok(Some(Signal::SIGTERM));
+                            }
                         };
                         let connection = match connections.get_mut(&peer) {
                             Some((connection, deadline)) => {
@@ -430,11 +506,13 @@ pub mod common {
                             }
                             None => {
                                 if matches!(mode, UDPNodeMode::Downstream(..)) {
+                                    tracing::debug!("Received incoming unrecognized packet in downstream mode, ignoring");
                                     continue;
                                 };
                                 let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
                                 if sender.send(Packet::Syn(connection.clone())).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 };
                                 connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
                                 connection
@@ -442,13 +520,19 @@ pub mod common {
                         };
                         let data = buffer_v4[..count].to_vec().into_boxed_slice();
                         if let Ok(attached) = connection.try_attach(data) { // Just drop UDP, it's proper "back pressure"
-                            sender.send(Packet::Data(attached)).await.map_err(|_| "End closed")?;
+                            sender.send(Packet::Data(attached)).await.map_err(|error| {
+                                tracing::error!("End closed: {error}");
+                                GraphError::Disconnected
+                            })?;
                         }
                     },
                     accepted_v6 = socket_v6.as_ref().expect("Unwrapping None which is Some").recv_from(&mut buffer_v6), if socket_v6.is_some() => {
                         let (count, peer) = match accepted_v6 {
                             Ok(result) => result,
-                            _ => return Ok(Some(Signal::SIGTERM))
+                            Err(error) => {
+                                tracing::error!("UDP receive failed: {error}");
+                                return Ok(Some(Signal::SIGTERM));
+                            }
                         };
                         let connection = match connections.get_mut(&peer) {
                             Some((connection, deadline)) => {
@@ -457,11 +541,13 @@ pub mod common {
                             }
                             None => {
                                 if matches!(mode, UDPNodeMode::Downstream(..)) {
+                                    tracing::debug!("Received incoming unrecognized packet in downstream mode, ignoring");
                                     continue;
                                 };
                                 let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
                                 if sender.send(Packet::Syn(connection.clone())).await.is_err() {
-                                    return Err("End Closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 };
                                 connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
                                 connection
@@ -469,7 +555,10 @@ pub mod common {
                         };
                         let data = buffer_v6[..count].to_vec().into_boxed_slice();
                         if let Ok(attached) = connection.try_attach(data) { // Just drop UDP, it's proper "back pressure"
-                            sender.send(Packet::Data(attached)).await.map_err(|_| "End closed")?;
+                            sender.send(Packet::Data(attached)).await.map_err(|error| {
+                                tracing::error!("End closed: {error}");
+                                GraphError::Disconnected
+                            })?;
                         }
                     },
                     _ = async move {
@@ -486,7 +575,8 @@ pub mod common {
                         for peer in expired {
                             if let Some((connection, _)) = connections.remove(&peer)
                                 && sender.send(Packet::Fin(connection)).await.is_err() {
-                                return Err("End closed");
+                                tracing::error!("End closed");
+                                return Err(GraphError::Disconnected);
                             }
                         }
                     }
@@ -497,7 +587,7 @@ pub mod common {
 
     /// Python arg type
     #[pyclass(skip_from_py_object)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum ChannelType {
         Signal,
         Upstream,
@@ -505,7 +595,7 @@ pub mod common {
     }
 
     /// Python arg type
-    #[derive(IntoPyObject)]
+    #[derive(IntoPyObject, Debug)]
     enum DetachedPacketSignalError {
         DetachedPacket(DetachedPacket),
         Signal(Signal),
@@ -513,13 +603,14 @@ pub mod common {
     }
 
     /// Python return type
-    #[derive(FromPyObject)]
+    #[derive(FromPyObject, Debug)]
     enum PythonCallbackReturnCode {
         Control(bool),
         Signal(Signal)
     }
 
     #[pyclass]
+    #[derive(Debug)]
     pub struct PythonNode {
         pub upstreams: Vec<NodeEndToken>,
         pub downstreams: Vec<NodeEndToken>,
@@ -531,7 +622,8 @@ pub mod common {
         #[allow(clippy::new_ret_no_self)]
         pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> Result<NodeToken, &'static str> {
             if !callback.is_callable() {
-                return Err("Callback not callable");
+                tracing::error!("Callback is not callable");
+                return Err("Callback is not callable");
             }
             let mut u = Vec::with_capacity(upstreams);
             let mut d = Vec::with_capacity(downstreams);
@@ -561,20 +653,22 @@ pub mod common {
 
     #[async_trait]
     impl Node for PythonNode {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
-            self.upstreams.clone()
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
+            Ok(self.upstreams.clone())
         }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
-            self.downstreams.clone()
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
+            Ok(self.downstreams.clone())
         }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
+        #[tracing::instrument(name="PythonNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             let mut upstreams = Vec::with_capacity(self.upstreams.len());
             for upstream in &mut self.upstreams {
-                upstreams.push(upstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?);
+                upstreams.push(upstream.receiver().map_err(GraphError::from)?
+                );
             }
             let mut downstreams = Vec::with_capacity(self.downstreams.len());
             for downstream in &mut self.downstreams {
-                downstreams.push(downstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?);
+                downstreams.push(downstream.receiver().map_err(GraphError::from)?);
             }
             loop {
                 let (channel_type, index, outcome) = {
@@ -583,7 +677,7 @@ pub mod common {
                         node_ends.push(Box::pin(async move {
                             match receiver.recv().await {
                                 Some(packet) => (ChannelType::Upstream, index, DetachedPacketSignalError::DetachedPacket(packet.detach())),
-                                None => (ChannelType::Upstream, index, DetachedPacketSignalError::Error(()))
+                                None => (ChannelType::Upstream, index, DetachedPacketSignalError::Error(())) // This error is mapped to actual error later in loop
                             }
                         }));
                     }
@@ -598,21 +692,33 @@ pub mod common {
                     if node_ends.is_empty() {
                         match self.signal_receiver.recv().await {
                             Some(signal) => (ChannelType::Signal, 0, DetachedPacketSignalError::Signal(signal)),
-                            None => return Err("Signal handle closed")
+                            None => {
+                                tracing::error!("Signal handle closed");
+                                return Err(GraphError::Disconnected)
+                            }
                         }
                     } else {
                         tokio::select! {
                             biased;
                             signal = self.signal_receiver.recv() => match signal {
-                                Some(signal) => (ChannelType::Signal, 0, DetachedPacketSignalError::Signal(signal)),
-                                None => return Err("Signal handle closed")
+                                Some(signal) => {
+                                    if signal == Signal::SIGTERM {
+                                        return Ok(None);
+                                    }
+                                    (ChannelType::Signal, 0, DetachedPacketSignalError::Signal(signal))
+                                },
+                                None => {
+                                    tracing::error!("Signal handle closed");
+                                    return Err(GraphError::Disconnected)
+                                }
                             },
                             packet = select_all(node_ends) => packet.0, // Cancel safe
                         }
                     }
                 };
                 if matches!(&outcome, DetachedPacketSignalError::Error(())) {
-                    return Err("End is closed");
+                    tracing::error!("End is closed");
+                    return Err(GraphError::Disconnected);
                 }
                 let result = Python::attach(|py| {
                     let channel_type = Py::new(py, channel_type)?;
@@ -623,7 +729,10 @@ pub mod common {
                     Ok(PythonCallbackReturnCode::Control(false)) => continue,
                     Ok(PythonCallbackReturnCode::Control(true)) => return Ok(None),
                     Ok(PythonCallbackReturnCode::Signal(signal)) => return Ok(Some(signal)),
-                    _ => return Ok(Some(Signal::SIGTERM)),
+                    _ => {
+                        tracing::error!("Python callback returned invalid value {:?}", result);
+                        return Ok(Some(Signal::SIGTERM));
+                    }
                 }
             }
         }
@@ -642,7 +751,7 @@ pub mod common {
             }
         }
         fn next(&mut self) -> u16 {
-            self.counter += 0x9e3779b97f4a7c15_usize;
+            self.counter += 1;
             self.state.write_usize(self.counter);
             self.state.finish() as u16
         }
@@ -661,6 +770,7 @@ pub mod common {
             blocked.remove(&connection); // Drops packets
             let packet = Packet::Fin(connection);
             if upstream_sender.send(packet).await.is_err() {
+                tracing::error!("End closed");
                 return true;
             }
         }
@@ -677,7 +787,7 @@ pub mod common {
     struct DNSQuery<'a> {
         name: &'a str,
         qtypes: &'a [TYPE],
-        id: u16 // id is just for security, removable if we're fine being attacked
+        id: u16 // id is just for security, techinically removable if we're fine being attacked
     }
 
     struct DNSReply<'a> {
@@ -693,15 +803,25 @@ pub mod common {
             let box_buffer; // Lifetime extension
             let reply = match self {
                 DNSResolver::Socket(socket) => {
-                    let count = socket.recv(dns_buffer).await.map_err(|_| Some(Signal::SIGTERM))?;
-                    DNSPacket::parse(&dns_buffer[..count]).map_err(|_| None)?
+                    let Ok(count) = socket.recv(dns_buffer).await else {
+                        tracing::error!("DNS resolver socket closed");
+                        return Err(Some(Signal::SIGTERM));
+                    };
+                    DNSPacket::parse(&dns_buffer[..count]).map_err(|_| {
+                        tracing::debug!("Received invalid DNS response");
+                        None
+                    })?
                 },
                 DNSResolver::End(_, receiver, _) => {
                     let Packet::Data(attached) = receiver.recv().await.ok_or(Signal::SIGTERM)? else {
+                        tracing::error!("Received non-data packet from DNS resolver");
                         return Err(Some(Signal::SIGTERM));
                     };
                     box_buffer = attached.detach().data;
-                    DNSPacket::parse(&box_buffer).map_err(|_| None)?
+                    DNSPacket::parse(&box_buffer).map_err(|_| {
+                        tracing::debug!("Received invalid DNS response");
+                        None
+                    })?
                 }
             };
             let question = reply.questions.first().ok_or(None)?;
@@ -716,7 +836,7 @@ pub mod common {
                     (RData::CNAME(_), _) if rdata.is_none() => {
                         rdata = Some(record.rdata.clone().into_owned());
                     }
-                    _ => {}
+                    _ => tracing::debug!("DNS reply has no recognizable answer")
                 }
             }
             Ok(DNSReply {
@@ -729,18 +849,30 @@ pub mod common {
         async fn query(&mut self, query: DNSQuery<'_>) -> Result<(), Option<Signal>> {
             for qtype in query.qtypes {
                 let data = {
-                    let name = Name::new(query.name).map_err(|_| None)?;
+                    let name = Name::new(query.name).map_err(|_| {
+                        tracing::debug!("Invalid queried domain");
+                        None
+                    })?;
                     let mut packet = DNSPacket::new_query(query.id);
                     packet.questions.push(Question::new(name, (*qtype).into(), QCLASS::CLASS(CLASS::IN), false));
-                    packet.build_bytes_vec_compressed().map_err(|_| Signal::SIGTERM)? // Not very sure why this is Result
+                    packet.build_bytes_vec_compressed().map_err(|_| {
+                        tracing::debug!("c022d224-e635-4f41-993f-e8ac9b1cdb43"); // Yes, a random uuid because I'm not very sure when it will happen
+                        Signal::SIGTERM
+                    })?
                 };
                 match self {
                     DNSResolver::Socket(socket) => {
-                        socket.send(&data).await.map_err(|_| Some(Signal::SIGTERM))?;
+                        socket.send(&data).await.map_err(|_| {
+                            tracing::error!("DNS resolver socket closed");
+                            Some(Signal::SIGTERM)
+                        })?;
                     }
                     DNSResolver::End(sender, _, connection) => {
                         let attached = connection.attach(data.into_boxed_slice()).await;
-                        sender.send(Packet::Data(attached)).await.map_err(|_| Some(Signal::SIGTERM))?;
+                        sender.send(Packet::Data(attached)).await.map_err(|_| {
+                            tracing::debug!("DNS resolver downstream closed");
+                            Some(Signal::SIGTERM)
+                        })?;
                     }
                 }
             }
@@ -772,6 +904,7 @@ pub mod common {
     /// 
     /// User may specify the size and TTL of the node-local DNS cache.
     #[pyclass]
+    #[derive(Debug)]
     pub struct DNSNode {
         upstream: NodeEndToken,
         downstream: NodeEndToken,
@@ -787,6 +920,7 @@ pub mod common {
         #[allow(clippy::new_ret_no_self)]
         pub fn new(mut resolver: Host, port: u16, middleware: bool, mode: AddressMode, size: u64, ttl: Duration) -> Result<NodeToken, &'static str> {
             let Some(resolver) = resolver.wait_resolve() else {
+                tracing::error!("Invalid host");
                 return Err("Invalid host");
             };
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
@@ -823,6 +957,7 @@ pub mod common {
         // Port is deferred in argv because it's very unlikely that you'll ever need it
         fn python_new(resolver: Host, middleware: bool, size: u64, ttl: f64, mode: AddressMode, port: u16) -> PyResult<NodeToken> {
             if ttl <= 0.0 {
+                tracing::error!("Invalid TTL");
                 return Err(PyValueError::new_err("Invalid TTL"));
             }
             Self::new(resolver, port, middleware, mode, size, Duration::from_secs_f64(ttl)).map_err(PyValueError::new_err)
@@ -831,35 +966,40 @@ pub mod common {
 
     #[async_trait]
     impl Node for DNSNode {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
-            vec![self.upstream.clone()]
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
+            Ok(vec![self.upstream.clone()])
         }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.resolver_downstream.clone() {
-                None => vec![self.downstream.clone()],
-                Some(end) => vec![self.downstream.clone(), end]
+                None => Ok(vec![self.downstream.clone()]),
+                Some(end) => Ok(vec![self.downstream.clone(), end])
             }
         }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
-            let upstream_sender = self.upstream.sender().ok_or("Node is improperly connected")?;
-            let mut upstream_receiver = self.upstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
-            let downstream_sender = self.downstream.sender().ok_or("Node is improperly connected")?;
-            let mut downstream_receiver = self.downstream.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
+        #[tracing::instrument(name="DNSNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let upstream_sender = self.upstream.sender().map_err(GraphError::from)?;
+            let mut upstream_receiver = self.upstream.receiver().map_err(GraphError::from)?;
+            let downstream_sender = self.downstream.sender().map_err(GraphError::from)?;
+            let mut downstream_receiver = self.downstream.receiver().map_err(GraphError::from)?;
             let mut resolver = match &self.resolver_downstream {
                 None => {
                     let socket = match self.resolver {
-                        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await.map_err(|_| "Cannot bind v4 UDP port")?,
-                        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await.map_err(|_| "Cannot bind v6 UDP port")?
+                        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await.map_err(|error| { tracing::error!("Cannot bind v4 UDP port: {error}"); GraphError::NodeError })?,
+                        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await.map_err(|error| { tracing::error!("Cannot bind v6 UDP port: {error}"); GraphError::NodeError })?
                     };
-                    socket.connect(self.resolver).await.map_err(|_| "Cannot connect to resolver")?;
+                    socket.connect(self.resolver).await.map_err(|error| {
+                        tracing::error!("Cannot connect to resolver: {error}");
+                        GraphError::NodeError
+                    })?;
                     DNSResolver::Socket(socket)
                 },
                 Some(end) => {
-                    let resolver_sender = end.sender().ok_or("Node is improperly connected")?;
-                    let resolver_receiver = end.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
+                    let resolver_sender = end.sender().map_err(GraphError::from)?;
+                    let resolver_receiver = end.receiver().map_err(GraphError::from)?;
                     let resolver_connection = ConnectionToken::new(Host::IpAddr(self.resolver.ip()), Transport::UDP, self.resolver.port());
                     if resolver_sender.send(Packet::Syn(resolver_connection.clone())).await.is_err() {
-                        return Err("End closed");
+                        tracing::error!("End closed");
+                        return Err(GraphError::Disconnected);
                     }
                     DNSResolver::End(resolver_sender, resolver_receiver, resolver_connection)
                 }
@@ -885,7 +1025,10 @@ pub mod common {
                     biased;
                     signal = self.signal_receiver.recv() => match signal {
                         Some(Signal::SIGTERM) => return Ok(None),
-                        None => return Err("Signal receiver is closed"),
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
                         _ => continue
                     },
                     packet = upstream_receiver.recv() => match packet {
@@ -920,18 +1063,21 @@ pub mod common {
                                     Some(Some(ip_addr)) => {
                                         connection.resolve(ip_addr);
                                         if downstream_sender.send(packet).await.is_err() {
-                                            return Ok(Some(Signal::SIGTERM));
+                                            tracing::error!("End closed");
+                                            return Err(GraphError::Disconnected);
                                         }
                                     }
                                     Some(None) => { // Negative cache hit
                                         if upstream_sender.send(Packet::Fin(connection.clone())).await.is_err() {
-                                            return Err("End closed");
+                                            tracing::error!("End closed");
+                                            return Err(GraphError::Disconnected);
                                         }
                                     }
                                     None => {
                                         let Some(name) = terminal else { // CNAME exhaustion (Only reachable by cycle)
                                             if upstream_sender.send(Packet::Fin(connection.clone())).await.is_err() {
-                                                return Err("End closed");
+                                                tracing::error!("End closed");
+                                                return Err(GraphError::Disconnected);
                                             }
                                             continue;
                                         };
@@ -967,10 +1113,14 @@ pub mod common {
                             if let Some(packets) = blocked.get_mut(&connection) {
                                 packets.push(packet);
                             } else if downstream_sender.send(packet).await.is_err() {
-                                return Ok(Some(Signal::SIGTERM));
+                                tracing::error!("End closed");
+                                return Err(GraphError::Disconnected);
                             }
                         },
-                        None => return Err("End")
+                        None => {
+                            tracing::error!("End closed"); 
+                            return Err(GraphError::Disconnected);
+                        }
                     },
                     received = resolver.recv(&mut dns_buffer) => {
                         let reply = match received {
@@ -996,7 +1146,8 @@ pub mod common {
                                 if let Some(packets) = blocked.remove(&connection) {
                                     for packet in packets {
                                         if downstream_sender.send(packet).await.is_err() {
-                                            return Ok(Some(Signal::SIGTERM));
+                                            tracing::error!("End closed");
+                                            return Err(GraphError::Disconnected);
                                         }
                                     }
                                 }

@@ -192,18 +192,18 @@ pub mod socks5 {
         target: &ConnectionToken,
         sender: &Sender<Packet>,
         queue: Vec<Box<[u8]>>
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), GraphError> {
         for data in queue {
-            sender.send(Packet::Data(target.attach(data).await)).await.map_err(|_| "End closed")?;
+            sender.send(Packet::Data(target.attach(data).await)).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
         }
         loop {
             match receiver.recv().await {
                 Some(Packet::Data(attached)) => {
                     let data = attached.detach().data;
-                    sender.send(Packet::Data(target.attach(data).await)).await.map_err(|_| "End closed")?;
+                    sender.send(Packet::Data(target.attach(data).await)).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
                 },
                 Some(Packet::Fin(_)) => {
-                    sender.send(Packet::Fin(target.clone())).await.map_err(|_| "End closed")?;
+                    sender.send(Packet::Fin(target.clone())).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
                     return Ok(());
                 },
                 Some(Packet::Syn(_)) | None => return Ok(())
@@ -224,6 +224,7 @@ pub mod socks5 {
     /// The host of an inbound SOCKS5 request is faithfully translated into the
     /// session host without bothering DNS.
     #[pyclass]
+    #[derive(Debug)]
     pub struct SOCKS5Node {
         transport: NodeEndToken,
         session: NodeEndToken,
@@ -237,7 +238,10 @@ pub mod socks5 {
             let server = match server.map(|mut server| (server.0.wait_resolve(), server.1)) {
                 Some((Some(ip), port)) => Some(SocketAddr::new(ip, port)),
                 None => None,
-                _ => return Err("Server is unreachable")
+                _ => {
+                    tracing::error!("Server is unreachable");
+                    return Err("Server is unreachable");
+                }
             };
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
             Ok(NodeToken::new(
@@ -258,39 +262,40 @@ pub mod socks5 {
         #[pyo3(signature = (server = None))]
         #[allow(clippy::new_ret_no_self)]
         fn python_new(server: Option<(Host, u16)>) -> PyResult<NodeToken> {
-            Self::new(server).map_err(|message| PyValueError::new_err(message))
+            Self::new(server).map_err(PyValueError::new_err)
         }
     }
 
     #[async_trait]
     impl Node for SOCKS5Node {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.server {
-                None => vec![self.transport.clone()],
-                _ => vec![self.session.clone()]
+                None => Ok(vec![self.transport.clone()]),
+                _ => Ok(vec![self.session.clone()])
             }
         }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             match self.server {
-                None => vec![self.session.clone()],
-                _ => vec![self.transport.clone()]
+                None => Ok(vec![self.session.clone()]),
+                _ => Ok(vec![self.transport.clone()])
             }
         }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
+        #[tracing::instrument(name="SOCKS5Node::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             self.signal_receiver.drain();
             match self.server {
                 None => {
-                    let upstream_sender = self.transport.sender().ok_or("Node is improperly connected")?;
-                    let upstream_receiver = self.transport.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
-                    let downstream_sender = self.session.sender().ok_or("Node is improperly connected")?;
-                    let downstream_receiver = self.session.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
+                    let upstream_sender = self.transport.sender().map_err(GraphError::from)?;
+                    let upstream_receiver = self.transport.receiver().map_err(GraphError::from)?;
+                    let downstream_sender = self.session.sender().map_err(GraphError::from)?;
+                    let downstream_receiver = self.session.receiver().map_err(GraphError::from)?;
                     self.run_server(upstream_sender, upstream_receiver, downstream_sender, downstream_receiver).await
                 },
                 Some(server) => {
-                    let upstream_sender = self.session.sender().ok_or("Node is improperly connected")?;
-                    let upstream_receiver = self.session.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
-                    let downstream_sender = self.transport.sender().ok_or("Node is improperly connected")?;
-                    let downstream_receiver = self.transport.receiver().map_err(|_| "End is occupied")?.ok_or("Node is improperly connected")?;
+                    let upstream_sender = self.session.sender().map_err(GraphError::from)?;
+                    let upstream_receiver = self.session.receiver().map_err(GraphError::from)?;
+                    let downstream_sender = self.transport.sender().map_err(GraphError::from)?;
+                    let downstream_receiver = self.transport.receiver().map_err(GraphError::from)?;
                     self.run_client(upstream_sender, upstream_receiver, downstream_sender, downstream_receiver, server).await
                 }
             }
@@ -299,13 +304,14 @@ pub mod socks5 {
 
     impl SOCKS5Node {
         #[allow(clippy::mutable_key_type)]
+        #[tracing::instrument(name="SOCKS5Node::run_server", skip_all)]
         async fn run_server(
             &mut self,
             upstream_sender: Sender<Packet>, // SOCKS5 raw
             mut upstream_receiver: OwnedMutexGuard<Receiver<Packet>>,
             downstream_sender: Sender<Packet>, // Proxied data
             mut downstream_receiver: OwnedMutexGuard<Receiver<Packet>>
-        ) -> Result<Option<Signal>, &'static str> {
+        ) -> Result<Option<Signal>, GraphError> {
             let router: Arc<MutexStd<Router>> = Arc::new(MutexStd::new(Router::default()));
             let mut handlers: JoinSet<Option<Signal>> = JoinSet::new(); // This cancels on drop
             loop {
@@ -313,14 +319,24 @@ pub mod socks5 {
                     biased;
                     signal = self.signal_receiver.recv() => match signal {
                         Some(Signal::SIGTERM) => return Ok(None),
-                        None => return Err("Signal receiver is closed"),
-                        _ => continue
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
+                        Some(signal) => {
+                            tracing::warn!("Received unknown signal {:?}", signal);
+                            continue
+                        }
                     },
                     handler = handlers.join_next(), if !handlers.is_empty() => match handler {
                         None => unreachable!("Awaiting non-empty join set that is empty"),
-                        Some(Err(_)) => continue,
+                        Some(Err(error)) => {
+                            tracing::warn!("SOCKS5 handler task failed: {error}");
+                            continue;
+                        }
                         Some(Ok(signal)) => {
                             if let Some(signal) = signal {
+                                tracing::warn!("SOCKS5 handler returned signal {:?}, propagating", signal);
                                 return Ok(Some(signal));
                             }
                             continue;
@@ -346,9 +362,13 @@ pub mod socks5 {
                         Some(packet) => {
                             let sender = router.lock().expect("Router is poisoned").transport.get(packet.connection()).cloned();
                             match sender {
-                                Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if upstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
-                                    return Err("End closed");
+                                Some(sender) => { let _ = sender.send(packet).await; }, // Guaranteed to success, given that packets after FIN does not matter
+                                None if !packet.is_fin() => {
+                                    tracing::debug!("Received packet that does not belong");
+                                    if upstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
+                                        tracing::error!("End closed");
+                                        return Err(GraphError::Disconnected);
+                                    }
                                 },
                                 None => continue
                             }
@@ -358,7 +378,8 @@ pub mod socks5 {
                     packet = downstream_receiver.recv() => match packet {
                         Some(Packet::Syn(session)) => {
                             if downstream_sender.send(Packet::Fin(session)).await.is_err() {
-                                return Err("End closed");
+                                tracing::error!("End closed");
+                                return Err(GraphError::Disconnected);
                             }
                         },
                         Some(packet) => {
@@ -366,7 +387,8 @@ pub mod socks5 {
                             match sender {
                                 Some(sender) => { let _ = sender.send(packet).await; },
                                 None if !packet.is_fin() => if downstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 },
                                 None => continue
                             }
@@ -378,6 +400,7 @@ pub mod socks5 {
         }
 
         #[allow(clippy::mutable_key_type)]
+        #[tracing::instrument(name="SOCKS5Node::run_client", skip_all)]
         async fn run_client(
             &mut self,
             upstream_sender: Sender<Packet>, // Proxied data
@@ -385,7 +408,7 @@ pub mod socks5 {
             downstream_sender: Sender<Packet>, // SOCKS5 raw
             mut downstream_receiver: OwnedMutexGuard<Receiver<Packet>>,
             server: SocketAddr
-        ) -> Result<Option<Signal>, &'static str> {
+        ) -> Result<Option<Signal>, GraphError> {
             let router: Arc<MutexStd<Router>> = Arc::new(MutexStd::new(Router::default()));
             let mut handlers: JoinSet<Option<Signal>> = JoinSet::new();
             loop {
@@ -393,12 +416,18 @@ pub mod socks5 {
                     biased;
                     signal = self.signal_receiver.recv() => match signal {
                         Some(Signal::SIGTERM) => return Ok(None),
-                        None => return Err("Signal receiver is closed"),
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
                         _ => continue
                     },
                     handler = handlers.join_next(), if !handlers.is_empty() => match handler {
                         None => unreachable!("Awaiting non-empty join set that is empty"),
-                        Some(Err(_)) => continue,
+                        Some(Err(error)) => {
+                            tracing::warn!("SOCKS5 handler task failed: {error}");
+                            continue;
+                        }
                         Some(Ok(signal)) => {
                             if let Some(signal) = signal {
                                 return Ok(Some(signal));
@@ -429,7 +458,8 @@ pub mod socks5 {
                             match sender {
                                 Some(sender) => { let _ = sender.send(packet).await; },
                                 None if !packet.is_fin() => if upstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 },
                                 None => continue
                             }
@@ -439,7 +469,8 @@ pub mod socks5 {
                     packet = downstream_receiver.recv() => match packet {
                         Some(Packet::Syn(transport)) => {
                             if downstream_sender.send(Packet::Fin(transport)).await.is_err() {
-                                return Err("End closed");
+                                tracing::error!("End closed");
+                                return Err(GraphError::Disconnected);
                             }
                         },
                         Some(packet) => {
@@ -447,7 +478,8 @@ pub mod socks5 {
                             match sender {
                                 Some(sender) => { let _ = sender.send(packet).await; },
                                 None if !packet.is_fin() => if downstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
-                                    return Err("End closed");
+                                    tracing::error!("End closed");
+                                    return Err(GraphError::Disconnected);
                                 },
                                 None => continue
                             }
@@ -493,6 +525,7 @@ pub mod socks5 {
         session_sender: Sender<Packet>,
         relay: &Relay
     ) -> Option<Signal> {
+        tracing::debug!("Accepted new connection from client");
         let mut buffer = Vec::new();
         let mut established = false;
         let session = loop {
@@ -505,6 +538,7 @@ pub mod socks5 {
                 match parse_client_hello(&buffer) {
                     Socks5ClientHello::Incomplete => continue,
                     Socks5ClientHello::Invalid => {
+                        tracing::debug!("Invalid SOCKS5 client hello");
                         if relay.upstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
@@ -524,12 +558,14 @@ pub mod socks5 {
             match parse_request(&buffer) {
                 Socks5Request::Incomplete => continue,
                 Socks5Request::Invalid => {
+                    tracing::debug!("Invalid SOCKS5 request");
                     if relay.upstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     return None;
                 },
                 Socks5Request::Unsupported => {
+                    tracing::debug!("Unsupported SOCKS5 request");
                     let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_COMMAND_UNSUPPORTED, 0x00, SOCKS5_ADDRESS_DOMAIN, 0x00, 0x00, 0x00]);
                     if relay.upstream_sender.send(Packet::Data(transport.attach(reply).await)).await.is_err() {
                         return Some(Signal::SIGTERM);
@@ -554,12 +590,19 @@ pub mod socks5 {
                 }
             }
         };
+        tracing::debug!("Established SOCKS5 connection");
         match tokio::select! {
             result = forward_handler(&mut transport_receiver, &session, &relay.downstream_sender, Vec::new()) => result,
             result = forward_handler(&mut session_receiver, &transport, &relay.upstream_sender, Vec::new()) => result
         } {
-            Ok(()) => None,
-            Err(_) => Some(Signal::SIGTERM)
+            Ok(()) => {
+                tracing::debug!("SOCKS5 connection closed");
+                None
+            },
+            Err(error) => {
+                tracing::error!("SOCKS5 session forwarding failed: {error}");
+                Some(Signal::SIGTERM)
+            }
         }
     }
 
@@ -600,6 +643,7 @@ pub mod socks5 {
         server: SocketAddr,
         relay: &Relay
     ) -> Option<Signal> {
+        tracing::debug!("SOCKS5 client connection reached server");
         let transport = ConnectionToken::new(Host::IpAddr(server.ip()), Transport::TCP, server.port());
         relay.router.lock().expect("Router is poisoned").transport.insert(transport.clone(), transport_sender);
         *transport_out = Some(transport.clone());
@@ -624,6 +668,7 @@ pub mod socks5 {
                             match parse_server_hello(&buffer) {
                                 Socks5ServerHello::Incomplete => continue,
                                 Socks5ServerHello::Invalid => {
+                                    tracing::debug!("Invalid SOCKS5 server hello");
                                     if relay.upstream_sender.send(Packet::Fin(session.clone())).await.is_err() {
                                         return Some(Signal::SIGTERM);
                                     }
@@ -646,6 +691,7 @@ pub mod socks5 {
                         match parse_reply(&buffer) {
                             Socks5Reply::Incomplete => continue,
                             Socks5Reply::Invalid => {
+                                tracing::debug!("Invalid SOCKS5 reply");
                                 if relay.upstream_sender.send(Packet::Fin(session.clone())).await.is_err() {
                                     return Some(Signal::SIGTERM);
                                 }
@@ -677,12 +723,19 @@ pub mod socks5 {
                 }
             }
         }
+        tracing::debug!("Established SOCKS5 connection with server");
         match tokio::select! {
             result = forward_handler(&mut transport_receiver, &session, &relay.upstream_sender, Vec::new()) => result,
             result = forward_handler(&mut session_receiver, &transport, &relay.downstream_sender, queue) => result
         } {
-            Ok(()) => None,
-            Err(_) => Some(Signal::SIGTERM)
+            Ok(()) => {
+                tracing::debug!("SOCKS5 connection with server closed");
+                None
+            },
+            Err(error) => {
+                tracing::error!("SOCKS5 session forwarding failed: {error}");
+                Some(Signal::SIGTERM)
+            }
         }
     }
 }

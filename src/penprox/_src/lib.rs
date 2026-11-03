@@ -14,4 +14,17 @@ mod penprox {
     use crate::_common::common;
     #[pymodule_export]
     use crate::_socks5::socks5;
+
+    use pyo3::prelude::*;
+
+    #[pymodule_init]
+    fn init(_: &Bound<'_, PyModule>) -> PyResult<()> {
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("fatal: Global logging subscriber conflict");
+        tracing::info!("Penprox ok");
+        Ok(())
+    }
 }

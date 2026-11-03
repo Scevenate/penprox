@@ -1,9 +1,9 @@
 #[pyo3::pymodule(submodule)]
 pub mod sdk {
-    use std::{any::Any, collections::HashMap, hash::{Hash, Hasher}, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}, usize};
+    use std::{any::Any, collections::HashMap, hash::{Hash, Hasher}, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
     use async_trait::async_trait;
     use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
-    use tokio::{sync::{Mutex as MutexTokio, OwnedMutexGuard, Semaphore, TryLockError, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
+    use tokio::{sync::{Mutex as MutexTokio, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
 
     pub const PACKET_BUFFER_SIZE: usize = 64;
     pub const SIGNAL_BUFFER_SIZE: usize = 8;
@@ -42,7 +42,7 @@ pub mod sdk {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub enum Transport {
         TCP,
         UDP
@@ -74,6 +74,7 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
     struct Connection {
         domain: Option<String>,
         ip: OnceLock<IpAddr>,
@@ -94,7 +95,7 @@ pub mod sdk {
     /// This is to reduce complexity and enable certain useful runtime casting behaviours,
     /// like casting inound to proxied or proxied to outbound.
     #[pyclass(from_py_object, frozen, eq, hash, name="Connection")]
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct ConnectionToken(Arc<Connection>);
 
     impl Eq for ConnectionToken {}
@@ -163,6 +164,7 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
     pub struct ConnectionAttached {
         connection: ConnectionToken,
         pub data: Box<[u8]>
@@ -213,7 +215,7 @@ pub mod sdk {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct ConnectionDetached {
         pub connection: ConnectionToken,
         pub data: Box<[u8]>
@@ -253,6 +255,7 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
     pub enum Packet {
         Syn(ConnectionToken),
         Data(ConnectionAttached),
@@ -295,7 +298,7 @@ pub mod sdk {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub enum DetachedPacket {
         Syn(ConnectionToken),
         Data(ConnectionDetached),
@@ -432,7 +435,7 @@ pub mod sdk {
 
     /// Unidirectional control message with high scheduling priority.
     #[pyclass(from_py_object, frozen, eq)]
-    #[derive(Clone, Copy, Eq, PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Signal {
         /// Ask a node to quit.
         /// 
@@ -460,6 +463,71 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
+    pub enum TokenAccessError {
+        Occupied,
+        Empty
+    }
+
+    impl std::fmt::Display for TokenAccessError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Occupied => write!(f, "Token access is occupied"),
+                Self::Empty => write!(f, "Token is empty")
+            }
+        }
+    }
+
+    impl std::error::Error for TokenAccessError {}
+
+    impl From<TokenAccessError> for PyErr {
+        fn from(error: TokenAccessError) -> Self {
+            match error {
+                TokenAccessError::Empty => PyValueError::new_err("Token is empty"),
+                TokenAccessError::Occupied => PyRuntimeError::new_err("Token is occupied")
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum GraphError {
+        Disconnected,
+        Occupied,
+        NodeError
+    }
+
+    impl std::fmt::Display for GraphError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Disconnected => write!(f, "Disconnected"),
+                Self::Occupied => write!(f, "Occupied"),
+                Self::NodeError => write!(f, "Node encountered unknown error")
+            }
+        }
+    }
+
+    impl std::error::Error for GraphError {}
+
+    impl From<GraphError> for PyErr {
+        fn from(error: GraphError) -> PyErr {
+            match error {
+                GraphError::Disconnected => PyRuntimeError::new_err("Disconnected"),
+                GraphError::Occupied => PyRuntimeError::new_err("Occupied"),
+                GraphError::NodeError => PyRuntimeError::new_err("Node encountered unknown error")
+            }
+        }
+    }
+
+    impl From<TokenAccessError> for GraphError {
+        fn from(error: TokenAccessError) -> Self {
+            match error {
+                TokenAccessError::Empty => Self::Disconnected,
+                TokenAccessError::Occupied => Self::Occupied
+            }
+        }
+    }
+
+    #[derive(Debug)]
     struct NodeEnd {
         receiver: Arc<MutexTokio<Receiver<Packet>>>, // This ArcMutex clones long held OwnedMutex token
         sender: Sender<Packet>
@@ -469,7 +537,7 @@ pub mod sdk {
     /// 
     /// A node end is a pluggable slot on the node.
     #[pyclass(from_py_object)]
-    #[derive(Clone, Default)]
+    #[derive(Clone, Default, Debug)]
     pub struct NodeEndToken(Arc<MutexStd<Option<NodeEnd>>>); // This Mutex is always short held
 
     impl NodeEndToken {
@@ -483,15 +551,33 @@ pub mod sdk {
                 sender
             })
         }
-        pub fn sender(&self) -> Option<Sender<Packet>> {
-            let guard = self.0.lock().expect("End is poisoned");
-            guard.as_ref().map(|node_end| node_end.sender.clone())
-        }
-        pub fn receiver(&self) -> Result<Option<OwnedMutexGuard<Receiver<Packet>>>, TryLockError> {
+        /// Get receiver.
+        /// 
+        /// Because of how often this is, it is already logged. You're welcome.
+        pub fn sender(&self) -> Result<Sender<Packet>, TokenAccessError> {
             let guard = self.0.lock().expect("End is poisoned");
             match guard.as_ref() {
-                Some(node_end) => Ok(Some(node_end.receiver.clone().try_lock_owned()?)),
-                None => Ok(None)
+                Some(end) => Ok(end.sender.clone()),
+                None => {
+                    tracing::error!("End is empty");
+                    Err(TokenAccessError::Empty)
+                }
+            }
+        }
+        /// Get receiver.
+        /// 
+        /// Because of how often this is, it is already logged. You're welcome.
+        pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<Packet>>, TokenAccessError> {
+            let guard = self.0.lock().expect("End is poisoned");
+            match guard.as_ref() {
+                Some(node_end) => node_end.receiver.clone().try_lock_owned().map_err(|_| {
+                    tracing::error!("End is occupied");
+                    TokenAccessError::Occupied
+                }),
+                None => {
+                    tracing::error!("End is empty");
+                    Err(TokenAccessError::Empty)
+                }
             }
         }
         /// Overwrites.
@@ -515,9 +601,7 @@ pub mod sdk {
             let Ok(packet) = packet.try_attach() else {
                 return Err(PyBufferError::new_err("Cannot put new packet into the graph"))
             };
-            let Some(sender) = self.sender() else {
-                return Err(PyRuntimeError::new_err("End is none"));
-            };
+            let sender = self.sender().map_err(PyErr::from)?;
             match sender.try_send(packet) {
                 Ok(_) => Ok(()),
                 Err(err) => {
@@ -531,9 +615,7 @@ pub mod sdk {
         /// This method will await if the connection reached its data packet count limit.
         async fn put(&self, packet: DetachedPacket) -> PyResult<()> {
             let packet = packet.attach().await;
-            let Some(sender) = self.sender() else {
-                return Err(PyRuntimeError::new_err("End is none"));
-            };
+            let sender = self.sender().map_err(PyErr::from)?;
             match sender.send(packet).await {
                 Ok(_) => Ok(()),
                 _ => Err(PyEOFError::new_err("End is closed"))
@@ -550,17 +632,20 @@ pub mod sdk {
     /// Any or pyclass class methods can be used to escape this interface,
     /// if necessary.
     #[async_trait]
-    pub trait Node: Any + Send {
-        fn upstreams(&self) -> Vec<NodeEndToken>;
-        fn downstreams(&self) -> Vec<NodeEndToken>;
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str>;
+    pub trait Node: Any + Send + std::fmt::Debug {
+        // It is indeed very unlikely this operation will fail
+        //
+        // But we need some escaping method otherwise they can only panic 
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError>;
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError>;
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError>;
     }
 
     /// General representation of a node.
     /// 
     /// The node lock is long held when running.
     #[pyclass(from_py_object, name="Node")]
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct NodeToken {
         node: Arc<MutexTokio<Box<dyn Node>>>,
         signal_sender: Sender<Signal>
@@ -578,38 +663,38 @@ pub mod sdk {
             self.signal_sender.try_send(signal)
         }
         /// Lock & run as rust `Future`.
-        pub async fn run(&mut self) -> Result<Result<Option<Signal>, &'static str>, &'static str> {
-            let mut guard = self.node.try_lock().map_err(|_| "Node is running")?;
+        pub async fn run(&self) -> Result<Result<Option<Signal>, GraphError>, TokenAccessError> {
+            let mut guard = self.node.try_lock().or(Err(TokenAccessError::Occupied))?;
             Ok(guard.as_mut().run().await)
         }
         /// `NodeEndToken::connect`, but you just provide index.
         /// 
         /// Connects upstream node downstream end to downstream node upstream end.
-        pub fn connect(upstream_node: &mut Self, downstream_index: usize, downstream_node: &mut Self, upstream_index: usize) -> Result<(), &'static str> {
-            let mut upstream_guard = upstream_node.node.try_lock().map_err(|_| "Node is running")?;
-            let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
-            let upstream_downstreams = upstream_guard.as_mut().downstreams();
-            let downstream_upstreams = downstream_guard.as_mut().upstreams();
+        pub fn connect(upstream_node: &mut Self, downstream_index: usize, downstream_node: &mut Self, upstream_index: usize) -> Result<(), TokenAccessError> {
+            let mut upstream_guard = upstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
+            let mut downstream_guard = downstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
+            let upstream_downstreams = upstream_guard.as_mut().downstreams()?;
+            let downstream_upstreams = downstream_guard.as_mut().upstreams()?;
             NodeEndToken::connect(&upstream_downstreams[downstream_index], &downstream_upstreams[upstream_index]);
             Ok(())
         }
         /// Connect upstream empty downstreams to downstream empty upstreams until either side is fully connected.
-        pub fn connect_all(upstream_node: &mut Self, downstream_node: &mut Self) -> Result<(), &'static str> {
+        pub fn connect_all(upstream_node: &mut Self, downstream_node: &mut Self) -> Result<(), TokenAccessError> {
             let empty_downstreams = {
-                let mut upstream_guard = upstream_node.node.try_lock().map_err(|_| "Node is running")?;
+                let mut upstream_guard = upstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
                 let mut indices = Vec::new();
-                for (index, downstream) in upstream_guard.as_mut().downstreams().iter().enumerate() {
-                    if downstream.0.try_lock().map_err(|_| "Cannot lock node end")?.is_none() {
+                for (index, downstream) in upstream_guard.as_mut().downstreams()?.iter().enumerate() {
+                    if downstream.0.try_lock().or(Err(TokenAccessError::Occupied))?.is_none() {
                         indices.push(index);
                     }
                 }
                 indices
             };
             let empty_upstreams = {
-                let mut downstream_guard = downstream_node.node.try_lock().map_err(|_| "Node is running")?;
+                let mut downstream_guard = downstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
                 let mut indices = Vec::new();
-                for (index, upstream) in downstream_guard.as_mut().upstreams().iter().enumerate() {
-                    if upstream.0.try_lock().map_err(|_| "Cannot lock node end")?.is_none() {
+                for (index, upstream) in downstream_guard.as_mut().upstreams()?.iter().enumerate() {
+                    if upstream.0.try_lock().or(Err(TokenAccessError::Occupied))?.is_none() {
                         indices.push(index);
                     }
                 }
@@ -628,12 +713,12 @@ pub mod sdk {
         /// 
         /// If none have `nodes()`, a new default `GraphNode` containing
         /// the two nodes is constructed.
-        pub fn merge(first: &Self, second: &Self) -> Result<Self, &'static str> {
+        pub fn merge(first: &Self, second: &Self) -> Result<Self, TokenAccessError> {
             // Avoid borrow lifetime problems
             let first_token = first.clone();
             let second_token = second.clone();
-            let mut first_guard = first.node.try_lock().map_err(|_| "Node is running")?;
-            let mut second_guard = second.node.try_lock().map_err(|_| "Node is running")?;
+            let mut first_guard = first.node.try_lock().or(Err(TokenAccessError::Occupied))?;
+            let mut second_guard = second.node.try_lock().or(Err(TokenAccessError::Occupied))?;
             let first_node: &mut dyn Any = &mut **first_guard;
             let second_node: &mut dyn Any = &mut **second_guard;
             match (first_node.downcast_mut::<GraphNode>(), second_node.downcast_mut::<GraphNode>()) {
@@ -665,23 +750,26 @@ pub mod sdk {
                 
             }
         }
-        /// Get a COPIED LIST of node upstreams.
+        /// A COPIED LIST of node upstreams.
+        #[getter]
         fn upstreams(&self) -> PyResult<Vec<NodeEndToken>> {
             match self.node.try_lock().as_mut() {
-                Ok(node) => Ok(node.upstreams()),
+                Ok(node) => Ok(node.upstreams().map_err(|_| PyRuntimeError::new_err("Node is running"))?),
                 _ => Err(PyRuntimeError::new_err("Node is running"))
             }
         }
-        /// Get a COPIED LIST of node downstreams.
+        /// A COPIED LIST of node downstreams.
+        #[getter]
         fn downstreams(&self) -> PyResult<Vec<NodeEndToken>> {
             match self.node.try_lock().as_mut() {
-                Ok(node) => Ok(node.downstreams()),
+                Ok(node) => Ok(node.downstreams().map_err(|_| PyRuntimeError::new_err("Node is running"))?),
                 _ => Err(PyRuntimeError::new_err("Node is running"))
             }
         }
-        /// Get a COPIED LIST of graph nodes.
+        /// A COPIED LIST of graph nodes.
         /// 
         /// Returns `None` if the node is not a graph.
+        #[getter]
         fn nodes(&self) -> PyResult<Option<Vec<Self>>> {
             let Ok(mut node) = self.node.try_lock() else {
                 return Err(PyRuntimeError::new_err("Node is running"))
@@ -692,24 +780,24 @@ pub mod sdk {
                 None => Ok(None)
             }
         }
-        /// Spawn tokio runtime and run blocked.
-        fn spawn(&mut self) -> PyResult<Option<Signal>> {
+        /// Hand over thread, spawn tokio runtime and run blocked.
+        fn spawn(&self, py: Python<'_>) -> PyResult<Option<Signal>> {
             let Ok(rt) = tokio::runtime::Runtime::new() else {
                 return Err(PyRuntimeError::new_err("Cannot spawn tokio runtime"))
             };
-            rt.block_on(self.run())
-                .map_err(PyRuntimeError::new_err)?
-                .map_err(PyRuntimeError::new_err)
+            py.detach(|| rt.block_on(self.run()))
+                .map_err(PyErr::from)?
+                .map_err(PyErr::from)
         }
         fn __rshift__(&mut self, other: &mut Self) -> PyResult<Self> {
-            Self::connect_all(self, other).map_err(PyRuntimeError::new_err)?;
-            Self::merge(self, other).map_err(PyRuntimeError::new_err)
+            Self::connect_all(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Self::merge(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))
         }
         fn __lshift__(&mut self, other: &mut Self) -> PyResult<Self> {
             Self::__rshift__(other, self)
         }
         fn __add__(&mut self, other: &mut Self) -> PyResult<Self> {
-            Self::merge(self, other).map_err(PyRuntimeError::new_err)
+            Self::merge(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))
         }
     }
 
@@ -717,6 +805,7 @@ pub mod sdk {
     /// 
     /// This node is implicitly constructed when two nodes merge.
     #[pyclass]
+    #[derive(Debug)]
     pub struct GraphNode {
         pub nodes: Vec<NodeToken>,
         pub signal_receiver: Receiver<Signal>
@@ -724,34 +813,37 @@ pub mod sdk {
 
     #[async_trait]
     impl Node for GraphNode {
-        fn upstreams(&self) -> Vec<NodeEndToken> {
+        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             let mut upstreams = Vec::new();
             for token in &self.nodes {
-                let mut guard = token.node.try_lock().expect("Node is running");
+                let mut guard = token.node.try_lock().map_err(|_| TokenAccessError::Occupied)?;
                 let node = guard.as_mut();
-                upstreams.extend(node.upstreams().iter().cloned());
+                upstreams.extend(node.upstreams()?.iter().cloned());
             }
-            upstreams
+            Ok(upstreams)
         }
-        fn downstreams(&self) -> Vec<NodeEndToken> {
+        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
             let mut downstreams = Vec::new();
             for token in &self.nodes {
-                let mut guard = token.node.try_lock().expect("Node is running");
+                let mut guard = token.node.try_lock().map_err(|_| TokenAccessError::Occupied)?;
                 let node = guard.as_mut();
-                downstreams.extend(node.downstreams().iter().cloned());
+                downstreams.extend(node.downstreams()?.iter().cloned());
             }
-            downstreams
+            Ok(downstreams)
         }
-        async fn run(&mut self) -> Result<Option<Signal>, &'static str> {
+        #[tracing::instrument(name="GraphNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             self.signal_receiver.drain();
             for token in &self.nodes {
                 if token.node.try_lock().is_err() {
-                    return Err("Node is already running");
+                    tracing::error!("Nodes are already running");
+                    return Err(GraphError::Occupied);
                 }
             }
-            let mut tasks: JoinSet<Result<Result<Option<Signal>, &'static str>, &'static str>> = JoinSet::new();
+            tracing::info!("New graph up");
+            let mut tasks: JoinSet<Result<Result<Option<Signal>, GraphError>, TokenAccessError>> = JoinSet::new();
             for token in &self.nodes {
-                let mut token = token.clone();
+                let token = token.clone();
                 tasks.spawn(async move { token.run().await });
             }
             loop {
@@ -762,21 +854,39 @@ pub mod sdk {
                             for token in &self.nodes {
                                 let _ = token.signal(signal);
                             }
+                            if signal == Signal::SIGTERM {
+                                return Ok(None);
+                            }
                         }
-                        None => return Err("Signal receiver is closed")
+                        None => {
+                            tracing::error!("Signal sender was closed");
+                            return Err(GraphError::Disconnected)
+                        }
                     },
                     joined = tasks.join_next() => match joined {
-                        None => return Ok(None),
+                        None => {
+                            tracing::info!("All nodes in graph retured, recursively returning");
+                            return Ok(None)
+                        },
                         Some(Ok(Ok(Ok(Some(signal))))) => {
+                            tracing::warn!("Node returned with broadcast signal {:?}", signal);
                             for token in &self.nodes {
                                 let _ = token.signal(signal);
                             }
                         }
-                        Some(Ok(Ok(Ok(None)))) => {}
-                        Some(Ok(Ok(Err(_)))) | Some(Ok(Err(_))) | Some(Err(_)) => {
+                        Some(Ok(Ok(Err(error)))) => {
+                            tracing::warn!("Node returned with error {error}, broadcasting SIGTERM");
                             for token in &self.nodes {
                                 let _ = token.signal(Signal::SIGTERM);
                             }
+                        }
+                        Some(Ok(Ok(Ok(None)))) => tracing::info!("Node returned silent (Ok)"),
+                        _ => {
+                            tracing::error!("Join set failed");
+                            for token in &self.nodes {
+                                let _ = token.signal(Signal::SIGTERM);
+                            }
+                            return Err(GraphError::NodeError)
                         }
                     }
                 }
@@ -808,7 +918,7 @@ pub mod sdk {
     }
     
     /// A python-compatible utility enum with "both" option.
-    #[derive(Copy, Clone)]
+    #[derive(Copy, Clone, Debug)]
     pub enum AddressMode {
         V4,
         V6,
@@ -846,6 +956,7 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
     pub struct AbortOnDropHandle<T>(JoinHandle<T>);
 
     impl<T> AbortOnDropHandle<T> {
@@ -889,6 +1000,7 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
     pub struct Bijection<X: Eq + Hash + Clone, Y: Eq + Hash + Clone> {
         x: HashMap<X, Y>,
         y: HashMap<Y, X>
@@ -945,6 +1057,7 @@ pub mod sdk {
         }
     }
 
+    #[derive(Debug)]
     pub struct BijectionAD<X: Eq + Hash + Clone, Y: Eq + Hash + Clone, D: Clone> {
         x: HashMap<X, (Y, D)>,
         y: HashMap<Y, (X, D)>
