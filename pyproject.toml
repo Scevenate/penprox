@@ -5,11 +5,7 @@ description = "Proxy toolbox specialized for firewall penetration"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Unlicense"
-dependencies = [
-    "aiodns>=4.0.4",
-    "dnslib>=0.9.26",
-    "janus>=2.0.0",
-]
+dependencies = []
 
 [build-system]
 requires = [
@@ -24,3 +20,17 @@ dev = [
     "penprox",
     "ruff>=0.16.5",
 ]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[[tool.setuptools-rust.ext-modules]]
+target = "penprox._src.penprox"
+path = "src/penprox/_src/Cargo.toml"
+binding = "PyO3"
+
+[tool.uv.sources]
+penprox = { workspace = true, editable = true }

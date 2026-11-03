@@ -1,19 +1,15 @@
-"""
-High performance python proxy toolbox specialized in firewall penetration
+# Register submodules
 
-[Github repository](https://github.com/Scevenate/penprox)
-"""
+import sys as _sys
 
-# ruff: noqa: F401
+from ._src import penprox as _penprox
 
-from ._src.common import (
-    DemuxTCPUDPNode,
-    DownstreamTCPNode,
-    DownstreamUDPNode,
-    ExitNode,
-    MuxNode,
-    UpstreamTCPNode,
-    UpstreamUDPNode,
-)
-from ._src.dns import DNSMiddlewareNode
-from ._src.sdk import Edge, EdgeEnd, Graph, Node
+for _name in ("common", "sdk", "socks5"):
+    _sys.modules[f"{__name__}._src.penprox.{_name}"] = getattr(_penprox, _name)
+
+del _name, _penprox, _sys
+
+# Import basic objects
+
+from .common import *
+from .sdk import *

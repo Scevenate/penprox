@@ -49,19 +49,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "common"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "moka",
- "pyo3",
- "sdk",
- "simple-dns",
- "tokio",
-]
-
-[[package]]
 name = "crossbeam-channel"
 version = "0.5.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -439,16 +426,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "sdk"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "pyo3",
- "tokio",
-]
 
 [[package]]
 name = "simple-dns"

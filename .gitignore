@@ -1,4 +1,8 @@
-/.venv
-/target
+/.venv/
+/.ruff_cache/
+/target/
 __pycache__/
 /src/penprox.egg-info/
+/build/
+/dist/
+**.so

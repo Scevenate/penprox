@@ -1,10 +1,6 @@
-#[pyo3::pymodule]
-mod common {
-    #[cfg(feature = "library")]
-    use crate::sdk::sdk::*;
-    #[cfg(not(feature = "library"))]
-    use sdk::sdk::*;
-
+#[pyo3::pymodule(submodule)]
+pub mod common {
+    use crate::_sdk::sdk::*;
     use std::{collections::{HashMap, hash_map::RandomState}, hash::{BuildHasher, DefaultHasher, Hasher}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, pin::Pin, time::Duration};
     use async_trait::async_trait;
     use futures::future::select_all;
@@ -13,13 +9,27 @@ mod common {
     use simple_dns::{CLASS, Name, Packet as DNSPacket, QCLASS, QTYPE, Question, TYPE, rdata::RData};
     use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, UdpSocket}, sync::{OwnedMutexGuard, mpsc::{Receiver, Sender, channel}}, task::JoinSet, time::{Instant, sleep_until}};
 
+    pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const TCP_TIMEOUT: Duration = Duration::from_secs(300);
+    pub const UDP_TIMEOUT: Duration = Duration::from_secs(60);
+    pub const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+    pub const DNS_CNAME_DEPTH: u8 = 16;
+    pub const DNS_BUFFER_SIZE: usize = 2048;
+
     /// Handler for a TCP connection. Dials the connection if no `stream` is
     /// given, otherwise takes over the accepted stream and announces Syn.
     /// 
     /// Handles the entire lifetime of a connection (Syn, read, write and Fin).
-    /// 
     /// Unresolved domain connections are rejected. The handler does NOT check
     /// if receiver `Packet` belongs to the connection.
+    /// 
+    /// The buffer should be at least size `CONNECTION_BUFFER_SIZE`. The handler
+    /// will hold a `Packet::Data(ConnectionAttached)` while awaiting, meaning
+    /// at most `CONNECTION_BUFFER_SIZE - 1` `ConnectionAttached` may still exist.
+    /// 
+    /// Therefore, such buffer is guaranteed to be available if the sender is
+    /// aware of illegal packets (other than one `Fin`).
     async fn tcp_handler(
         stream: Option<TcpStream>,
         connection: ConnectionToken,
@@ -36,9 +46,9 @@ mod common {
                     }
                     return (connection, None);
                 };
-                match TcpStream::connect(SocketAddr::new(ip_addr, connection.port())).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
+                match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip_addr, connection.port()))).await {
+                    Ok(Ok(stream)) => stream,
+                    _ => {
                         if sender.send(Packet::Fin(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
@@ -67,7 +77,7 @@ mod common {
                     }
                     Packet::Fin(_) => return None,
                     Packet::Data(attached) => {
-                        if writer.write_all(&attached.data).await.is_err() {
+                        if !matches!(tokio::time::timeout(TCP_TIMEOUT, writer.write_all(&attached.data)).await, Ok(Ok(()))) { // ConnectionAttached is not dropped yet
                             if writer_sender.send(Packet::Fin(writer_connection)).await.is_err() {
                                 return Some(Signal::SIGTERM);
                             }
@@ -85,14 +95,14 @@ mod common {
                 result = &mut writer_task => {
                     return (connection, result.ok().flatten());
                 },
-                read = reader.read(&mut buffer) => match read {
-                    Ok(0) | Err(_) => {
+                read = tokio::time::timeout(TCP_TIMEOUT, reader.read(&mut buffer)) => match read {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
                         if sender.send(Packet::Fin(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
                         return (connection, None);
                     }
-                    Ok(count) => {
+                    Ok(Ok(count)) => {
                         let data = buffer[..count].to_vec().into_boxed_slice();
                         if sender.send(Packet::Data(connection.attach(data).await)).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
@@ -231,28 +241,39 @@ mod common {
                             },
                             packet = receiver.recv() => match packet {
                                 Some(packet) => {
-                                    let connection = packet.connection().clone();
-                                    if let Packet::Syn(connection) = &packet {
-                                        if let Some(handler) = dispatch.get(connection) {
-                                            let _ = handler.send(Packet::Fin(connection.clone())).await;
-                                            if sender.send(Packet::Fin(connection.clone())).await.is_err() {
-                                                return Err("End closed");
-                                            };
-                                            continue;
-                                        }
-                                        let (dispatch_sender, dispatch_receiver) = channel(CONNECTION_BUFFER_SIZE);
-                                        dispatch.insert(connection.clone(), dispatch_sender);
-                                        handlers.spawn(tcp_handler(None, connection.clone(), sender.clone(), dispatch_receiver));
-                                    } else {
-                                        match dispatch.get(&connection) {
-                                            Some(handler) => {
-                                                let _ = handler.send(packet).await;
-                                            },
-                                            None => if sender.send(Packet::Fin(connection)).await.is_err() {
-                                                return Err("End closed");
+                                    match packet {
+                                        Packet::Syn(connection) => {
+                                            if dispatch.contains_key(&connection) {
+                                                let handler = dispatch.remove(&connection).expect("Unwrapping None that is some");
+                                                let _ = handler.send(Packet::Fin(connection.clone())).await;
+                                                if sender.send(Packet::Fin(connection)).await.is_err() {
+                                                    return Err("End closed");
+                                                };
+                                                continue;
                                             }
-                                        };
+                                            let (dispatch_sender, dispatch_receiver) = channel(CONNECTION_BUFFER_SIZE);
+                                            dispatch.insert(connection.clone(), dispatch_sender);
+                                            handlers.spawn(tcp_handler(None, connection.clone(), sender.clone(), dispatch_receiver));
+                                        },
+                                        Packet::Data(attached) => {
+                                            match dispatch.get(attached.connection()) {
+                                                Some(handler) => {
+                                                    let _ = handler.send(Packet::Data(attached)).await;
+                                                },
+                                                None => if sender.send(Packet::Fin(attached.connection().clone())).await.is_err() {
+                                                    return Err("End closed");
+                                                }
+                                            };
+                                        },
+                                        Packet::Fin(connection) => {
+                                            if !dispatch.contains_key(&connection) {
+                                                continue;
+                                            }
+                                            let handler = dispatch.remove(&connection).expect("Removing non-existent key that is gettable");
+                                            let _ = handler.send(Packet::Fin(connection)).await;
+                                        }
                                     }
+                                    
                                 }
                                 None => return Ok(None)
                             }
@@ -344,10 +365,11 @@ mod common {
                     (socket_v4, socket_v6)
                 }
             };
-            let mut connections: HashMap<SocketAddr, ConnectionToken> = HashMap::new();
+            let mut connections: HashMap<SocketAddr, (ConnectionToken, Instant)> = HashMap::new();
             let mut buffer_v4 = [0u8; PACKET_DATA_SIZE];
             let mut buffer_v6 = [0u8; PACKET_DATA_SIZE];
             loop {
+                let deadline = connections.values().map(|(_, deadline)| *deadline).min();
                 tokio::select! {
                     biased;
                     signal = self.signal_receiver.recv() => match signal {
@@ -367,7 +389,7 @@ mod common {
                                 Host::Domain(_) => if sender.send(Packet::Fin(connection)).await.is_err() {
                                     return Err("End closed");
                                 },
-                                Host::IpAddr(ip_addr) => { connections.insert(SocketAddr::new(ip_addr, connection.port()), connection); }
+                                Host::IpAddr(ip_addr) => { connections.insert(SocketAddr::new(ip_addr, connection.port()), (connection, Instant::now() + UDP_TIMEOUT)); }
                             };
                         }
                         Some(Packet::Fin(connection)) => {
@@ -388,6 +410,9 @@ mod common {
                                     if let Some(socket) = socket {
                                         socket.send_to(&attached.data[..], SocketAddr::new(ip_addr, attached.connection().port())).await.map_err(|_| "UDP socket closed")?;
                                     };
+                                    if let Some((_, deadline)) = connections.get_mut(&SocketAddr::new(ip_addr, attached.connection().port())) {
+                                        *deadline = Instant::now() + UDP_TIMEOUT;
+                                    }
                                 }
                             }
                         },
@@ -398,8 +423,11 @@ mod common {
                             Ok(result) => result,
                             _ => return Ok(Some(Signal::SIGTERM))
                         };
-                        let connection = match connections.get(&peer) {
-                            Some(connection) => connection.clone(),
+                        let connection = match connections.get_mut(&peer) {
+                            Some((connection, deadline)) => {
+                                *deadline = Instant::now() + UDP_TIMEOUT;
+                                connection.clone()
+                            }
                             None => {
                                 if matches!(mode, UDPNodeMode::Downstream(..)) {
                                     continue;
@@ -408,7 +436,7 @@ mod common {
                                 if sender.send(Packet::Syn(connection.clone())).await.is_err() {
                                     return Err("End closed");
                                 };
-                                connections.insert(peer, connection.clone());
+                                connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
                                 connection
                             }
                         };
@@ -422,8 +450,11 @@ mod common {
                             Ok(result) => result,
                             _ => return Ok(Some(Signal::SIGTERM))
                         };
-                        let connection = match connections.get(&peer) {
-                            Some(connection) => connection.clone(),
+                        let connection = match connections.get_mut(&peer) {
+                            Some((connection, deadline)) => {
+                                *deadline = Instant::now() + UDP_TIMEOUT;
+                                connection.clone()
+                            }
                             None => {
                                 if matches!(mode, UDPNodeMode::Downstream(..)) {
                                     continue;
@@ -432,13 +463,31 @@ mod common {
                                 if sender.send(Packet::Syn(connection.clone())).await.is_err() {
                                     return Err("End Closed");
                                 };
-                                connections.insert(peer, connection.clone());
+                                connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
                                 connection
                             }
                         };
                         let data = buffer_v6[..count].to_vec().into_boxed_slice();
                         if let Ok(attached) = connection.try_attach(data) { // Just drop UDP, it's proper "back pressure"
                             sender.send(Packet::Data(attached)).await.map_err(|_| "End closed")?;
+                        }
+                    },
+                    _ = async move {
+                        match deadline {
+                            Some(deadline) => sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await
+                        }
+                    } => {
+                        let now = Instant::now();
+                        let expired: Vec<SocketAddr> = connections.iter()
+                            .filter(|(_, (_, deadline))| *deadline <= now)
+                            .map(|(peer, _)| *peer)
+                            .collect();
+                        for peer in expired {
+                            if let Some((connection, _)) = connections.remove(&peer)
+                                && sender.send(Packet::Fin(connection)).await.is_err() {
+                                return Err("End closed");
+                            }
                         }
                     }
                 }
@@ -580,10 +629,6 @@ mod common {
         }
     }
 
-    pub const DNS_TIMEOUT: Duration = Duration::from_secs(5);
-    pub const DNS_CNAME_DEPTH: u8 = 16;
-    pub const DNS_BUFFER_SIZE: usize = 2048;
-
     struct DNSNonce {
         state: DefaultHasher,
         counter: usize
@@ -711,6 +756,21 @@ mod common {
         budget: u8
     }
 
+    /// Node for DNS. Intercepts & blocks new connections with unresolved domain,
+    /// releasing after resolution.
+    /// 
+    /// When `middleware` is true, the node runs in middleware mode. The node
+    /// will have one upstream and one downstream, acts purely as a middleware
+    /// that resolves DNS locally.
+    /// 
+    /// When `middleware` is false, the node runs in explicit mode. The node
+    /// will have one upstream and two downstreams, in which the additional
+    /// downstream is for DNS traffic.
+    /// 
+    /// When operating with `V4` / `V6` address mode, DNSNode only tries to resolve
+    /// into the given address family. `V4V6` / `V6V4` are treated the same here.
+    /// 
+    /// User may specify the size and TTL of the node-local DNS cache.
     #[pyclass]
     pub struct DNSNode {
         upstream: NodeEndToken,
@@ -725,8 +785,6 @@ mod common {
 
     impl DNSNode {
         #[allow(clippy::new_ret_no_self)]
-        // Port is deferred to match python_new signature
-        // In rust you have to specify every arg anyway though
         pub fn new(mut resolver: Host, port: u16, middleware: bool, mode: AddressMode, size: u64, ttl: Duration) -> Result<NodeToken, &'static str> {
             let Some(resolver) = resolver.wait_resolve() else {
                 return Err("Invalid host");
