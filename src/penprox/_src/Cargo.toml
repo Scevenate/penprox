@@ -2,6 +2,11 @@
 name = "penprox"
 version = "0.1.0"
 edition = "2024"
+license = "Unlicense"
+description = "Python proxy toolbox"
+repository = "https://github.com/Scevenate/penprox"
+keywords = ["proxy", "python", "network"]
+categories = ["asynchronous", "network-programming"]
 
 [lib]
 name="penprox"
