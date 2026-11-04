@@ -1,9 +1,10 @@
 #[pyo3::pymodule(submodule)]
 pub mod sdk {
-    use std::{any::Any, collections::HashMap, hash::{Hash, Hasher}, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
+    use std::{any::Any, collections::HashMap, hash::{Hash, Hasher}, io::IsTerminal, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
     use async_trait::async_trait;
-    use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
+    use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyFileNotFoundError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
     use tokio::{sync::{Mutex as MutexTokio, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
     pub const PACKET_BUFFER_SIZE: usize = 64;
     pub const SIGNAL_BUFFER_SIZE: usize = 8;
@@ -11,6 +12,72 @@ pub mod sdk {
     pub const PACKET_DATA_SIZE: usize = 2048;
     /// Maximum amount of data packets a connection can safely buffer.
     pub const CONNECTION_BUFFER_SIZE: usize = 64;
+
+    #[derive(Clone, Debug)]
+    pub enum LogDestination {
+        Stdout,
+        Stderr,
+        File(std::path::PathBuf)
+    }
+
+    impl<'a, 'py> FromPyObject<'a, 'py> for LogDestination {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            let sys = obj.py().import("sys")?;
+            if obj.is(sys.getattr("stdout")?) {
+                return Ok(Self::Stdout);
+            }
+            if obj.is(sys.getattr("stderr")?) {
+                return Ok(Self::Stderr);
+            }
+            match obj.extract::<std::path::PathBuf>() {
+                Ok(path) => Ok(Self::File(path)),
+                Err(_) => Err(PyValueError::new_err("Invalid log destination. Expected sys.stdout, sys.stderr or a path"))
+            }
+        }
+    }
+
+    #[pyclass(from_py_object, frozen, eq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum LogLevel {
+        TRACE,
+        DEBUG,
+        INFO,
+        WARN,
+        ERROR
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (dest, level = LogLevel::INFO))]
+    fn set_logger(dest: LogDestination, level: LogLevel) -> PyResult<()> {
+        let (make_writer, ansi) = match dest {
+            LogDestination::Stdout => (BoxMakeWriter::new(std::io::stdout), std::io::stdout().is_terminal()),
+            LogDestination::Stderr => (BoxMakeWriter::new(std::io::stderr), std::io::stderr().is_terminal()),
+            LogDestination::File(path) => {
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|error| PyFileNotFoundError::new_err(error.to_string()))?;
+                (BoxMakeWriter::new(Arc::new(file)), false)
+            }
+        };
+        let level = match level {
+            LogLevel::TRACE => tracing::Level::TRACE,
+            LogLevel::DEBUG => tracing::Level::DEBUG,
+            LogLevel::INFO => tracing::Level::INFO,
+            LogLevel::WARN => tracing::Level::WARN,
+            LogLevel::ERROR => tracing::Level::ERROR
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(ansi)
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
 
     #[derive(FromPyObject, IntoPyObject, Clone)]
     pub enum Host {
@@ -434,7 +501,6 @@ pub mod sdk {
     }
 
     /// Unidirectional control message with high scheduling priority.
-    #[pyclass(from_py_object, frozen, eq)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Signal {
         /// Ask a node to quit.
@@ -450,6 +516,34 @@ pub mod sdk {
         /// 
         /// Unrecognized signals are simply discarded.
         SIGUSR2
+    }
+
+    impl<'a, 'py> FromPyObject<'a, 'py> for Signal {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            match obj.cast::<PyString>() {
+                Ok(obj) => match obj.to_str() {
+                    Ok("SIGTERM") => Ok(Self::SIGTERM),
+                    Ok("SIGUSR1") => Ok(Self::SIGUSR1),
+                    Ok("SIGUSR2") => Ok(Self::SIGUSR2),
+                    _ => Err(PyValueError::new_err("Invalid Value"))
+                },
+                _ => Err(PyValueError::new_err("Invalid Value"))
+            }
+        }
+    }
+
+    impl<'py> IntoPyObject<'py> for Signal {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            match self {
+                Self::SIGTERM => Ok(PyString::new(py, "SIGTERM").into_any()),
+                Self::SIGUSR1 => Ok(PyString::new(py, "SIGUSR1").into_any()),
+                Self::SIGUSR2 => Ok(PyString::new(py, "SIGUSR2").into_any())
+            }
+        }
     }
 
     pub trait Drain {

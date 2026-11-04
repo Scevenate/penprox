@@ -1,1 +1,3 @@
-WIP: Pre initial release
+# Penprox
+
+WIP. See [examples](./examples/).

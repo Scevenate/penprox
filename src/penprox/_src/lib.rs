@@ -19,11 +19,6 @@ mod penprox {
 
     #[pymodule_init]
     fn init(_: &Bound<'_, PyModule>) -> PyResult<()> {
-        let subscriber = tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).expect("fatal: Global logging subscriber conflict");
         tracing::info!("Penprox ok");
         Ok(())
     }
