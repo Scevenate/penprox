@@ -1,3 +1,5 @@
+#![allow(clippy::all)]
+
 #[pyo3::pymodule(submodule)]
 pub mod socks5 {
     use crate::_sdk::sdk::*;
@@ -202,11 +204,11 @@ pub mod socks5 {
                     let data = attached.detach().data;
                     sender.send(Packet::Data(target.attach(data).await)).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
                 },
-                Some(Packet::Fin(_)) => {
-                    sender.send(Packet::Fin(target.clone())).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
+                Some(Packet::FIN(_)) => {
+                    sender.send(Packet::FIN(target.clone())).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
                     return Ok(());
                 },
-                Some(Packet::Syn(_)) | None => return Ok(())
+                Some(Packet::SYN(_)) | None => return Ok(())
             }
         }
     }
@@ -244,15 +246,29 @@ pub mod socks5 {
                 }
             };
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            Ok(NodeToken::new(
-                Box::new(Self {
-                    transport: NodeEndToken::new(),
-                    session: NodeEndToken::new(),
-                    signal_receiver,
-                    server
-                }),
-                signal_sender
-            ))
+            let transport = NodeEndToken::new();
+            let session = NodeEndToken::new();
+            let socks5_node = Self {
+                transport: transport.clone(),
+                session: session.clone(),
+                signal_receiver,
+                server
+            };
+            if server.is_some() {
+                return Ok(NodeToken::new(
+                    Box::new(socks5_node),
+                    signal_sender,
+                    NodeInterface::new(vec![session]),
+                    NodeInterface::new(vec![transport])
+                ))
+            } else {
+                return Ok(NodeToken::new(
+                    Box::new(socks5_node),
+                    signal_sender,
+                    NodeInterface::new(vec![transport]),
+                    NodeInterface::new(vec![session])
+                ))
+            }
         }
     }
 
@@ -268,18 +284,6 @@ pub mod socks5 {
 
     #[async_trait]
     impl Node for SOCKS5Node {
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.server {
-                None => Ok(vec![self.transport.clone()]),
-                _ => Ok(vec![self.session.clone()])
-            }
-        }
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.server {
-                None => Ok(vec![self.session.clone()]),
-                _ => Ok(vec![self.transport.clone()])
-            }
-        }
         #[tracing::instrument(name="SOCKS5Node::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             self.signal_receiver.drain();
@@ -343,7 +347,7 @@ pub mod socks5 {
                         }
                     },
                     packet = upstream_receiver.recv() => match packet {
-                        Some(Packet::Syn(transport)) => {
+                        Some(Packet::SYN(transport)) => {
                             let (transport_sender, transport_receiver) = channel(CONNECTION_BUFFER_SIZE);
                             let (session_sender, session_receiver) = channel(CONNECTION_BUFFER_SIZE);
                             router.lock().expect("Router is poisoned").transport.insert(transport.clone(), transport_sender);
@@ -365,7 +369,7 @@ pub mod socks5 {
                                 Some(sender) => { let _ = sender.send(packet).await; }, // Guaranteed to success, given that packets after FIN does not matter
                                 None if !packet.is_fin() => {
                                     tracing::debug!("Received packet that does not belong");
-                                    if upstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
+                                    if upstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
                                         tracing::error!("End closed");
                                         return Err(GraphError::Disconnected);
                                     }
@@ -376,8 +380,8 @@ pub mod socks5 {
                         None => return Ok(None)
                     },
                     packet = downstream_receiver.recv() => match packet {
-                        Some(Packet::Syn(session)) => {
-                            if downstream_sender.send(Packet::Fin(session)).await.is_err() {
+                        Some(Packet::SYN(session)) => {
+                            if downstream_sender.send(Packet::FIN(session)).await.is_err() {
                                 tracing::error!("End closed");
                                 return Err(GraphError::Disconnected);
                             }
@@ -386,7 +390,7 @@ pub mod socks5 {
                             let sender = router.lock().expect("Router is poisoned").session.get(packet.connection()).cloned();
                             match sender {
                                 Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if downstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
+                                None if !packet.is_fin() => if downstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 },
@@ -436,7 +440,7 @@ pub mod socks5 {
                         }
                     },
                     packet = upstream_receiver.recv() => match packet {
-                        Some(Packet::Syn(session)) => {
+                        Some(Packet::SYN(session)) => {
                             let (session_sender, session_receiver) = channel(CONNECTION_BUFFER_SIZE);
                             let (transport_sender, transport_receiver) = channel(CONNECTION_BUFFER_SIZE);
                             router.lock().expect("Router is poisoned").session.insert(session.clone(), session_sender);
@@ -457,7 +461,7 @@ pub mod socks5 {
                             let sender = router.lock().expect("Router is poisoned").session.get(packet.connection()).cloned();
                             match sender {
                                 Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if upstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
+                                None if !packet.is_fin() => if upstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 },
@@ -467,8 +471,8 @@ pub mod socks5 {
                         None => return Ok(None)
                     },
                     packet = downstream_receiver.recv() => match packet {
-                        Some(Packet::Syn(transport)) => {
-                            if downstream_sender.send(Packet::Fin(transport)).await.is_err() {
+                        Some(Packet::SYN(transport)) => {
+                            if downstream_sender.send(Packet::FIN(transport)).await.is_err() {
                                 tracing::error!("End closed");
                                 return Err(GraphError::Disconnected);
                             }
@@ -477,7 +481,7 @@ pub mod socks5 {
                             let sender = router.lock().expect("Router is poisoned").transport.get(packet.connection()).cloned();
                             match sender {
                                 Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if downstream_sender.send(Packet::Fin(packet.connection().clone())).await.is_err() {
+                                None if !packet.is_fin() => if downstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 },
@@ -539,7 +543,7 @@ pub mod socks5 {
                     Socks5ClientHello::Incomplete => continue,
                     Socks5ClientHello::Invalid => {
                         tracing::debug!("Invalid SOCKS5 client hello");
-                        if relay.upstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
+                        if relay.upstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
                         return None;
@@ -559,18 +563,18 @@ pub mod socks5 {
                 Socks5Request::Incomplete => continue,
                 Socks5Request::Invalid => {
                     tracing::debug!("Invalid SOCKS5 request");
-                    if relay.upstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
+                    if relay.upstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     return None;
                 },
                 Socks5Request::Unsupported => {
                     tracing::debug!("Unsupported SOCKS5 request");
-                    let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_COMMAND_UNSUPPORTED, 0x00, SOCKS5_ADDRESS_DOMAIN, 0x00, 0x00, 0x00]);
+                    let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_COMMAND_UNSUPPORTED, 0x00, SOCKS5_ADDRESS_IPV4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     if relay.upstream_sender.send(Packet::Data(transport.attach(reply).await)).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
-                    if relay.upstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
+                    if relay.upstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     return None;
@@ -579,10 +583,10 @@ pub mod socks5 {
                     let session = ConnectionToken::new(host, Transport::TCP, port);
                     relay.router.lock().expect("Router is poisoned").session.insert(session.clone(), session_sender);
                     *session_out = Some(session.clone());
-                    if relay.downstream_sender.send(Packet::Syn(session.clone())).await.is_err() {
+                    if relay.downstream_sender.send(Packet::SYN(session.clone())).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
-                    let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, SOCKS5_ADDRESS_DOMAIN, 0x00, 0x00, 0x00]);
+                    let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, SOCKS5_ADDRESS_IPV4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     if relay.upstream_sender.send(Packet::Data(transport.attach(reply).await)).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
@@ -647,7 +651,7 @@ pub mod socks5 {
         let transport = ConnectionToken::new(Host::IpAddr(server.ip()), Transport::TCP, server.port());
         relay.router.lock().expect("Router is poisoned").transport.insert(transport.clone(), transport_sender);
         *transport_out = Some(transport.clone());
-        if relay.downstream_sender.send(Packet::Syn(transport.clone())).await.is_err() {
+        if relay.downstream_sender.send(Packet::SYN(transport.clone())).await.is_err() {
             return Some(Signal::SIGTERM);
         }
         let greeting = Box::from([SOCKS5_VERSION, 0x01, SOCKS5_METHOD_NO_AUTH]);
@@ -669,10 +673,10 @@ pub mod socks5 {
                                 Socks5ServerHello::Incomplete => continue,
                                 Socks5ServerHello::Invalid => {
                                     tracing::debug!("Invalid SOCKS5 server hello");
-                                    if relay.upstream_sender.send(Packet::Fin(session.clone())).await.is_err() {
+                                    if relay.upstream_sender.send(Packet::FIN(session.clone())).await.is_err() {
                                         return Some(Signal::SIGTERM);
                                     }
-                                    if relay.downstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
+                                    if relay.downstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
                                         return Some(Signal::SIGTERM);
                                     }
                                     return None;
@@ -692,10 +696,10 @@ pub mod socks5 {
                             Socks5Reply::Incomplete => continue,
                             Socks5Reply::Invalid => {
                                 tracing::debug!("Invalid SOCKS5 reply");
-                                if relay.upstream_sender.send(Packet::Fin(session.clone())).await.is_err() {
+                                if relay.upstream_sender.send(Packet::FIN(session.clone())).await.is_err() {
                                     return Some(Signal::SIGTERM);
                                 }
-                                if relay.downstream_sender.send(Packet::Fin(transport.clone())).await.is_err() {
+                                if relay.downstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
                                     return Some(Signal::SIGTERM);
                                 }
                                 return None;
@@ -703,12 +707,12 @@ pub mod socks5 {
                             Socks5Reply::Ok => break
                         }
                     },
-                    Some(Packet::Fin(_)) | None => {
-                        let _ = relay.upstream_sender.send(Packet::Fin(session.clone())).await;
+                    Some(Packet::FIN(_)) | None => {
+                        let _ = relay.upstream_sender.send(Packet::FIN(session.clone())).await;
                         return None;
                     },
-                    Some(Packet::Syn(_)) => {
-                        let _ = relay.downstream_sender.send(Packet::Fin(transport.clone())).await;
+                    Some(Packet::SYN(_)) => {
+                        let _ = relay.downstream_sender.send(Packet::FIN(transport.clone())).await;
                         return None;
                     }
                 },
@@ -716,8 +720,8 @@ pub mod socks5 {
                     Some(Packet::Data(attached)) => {
                         queue.push(attached.detach().data);
                     },
-                    Some(Packet::Fin(_)) | None | Some(Packet::Syn(_)) => {
-                        let _ = relay.downstream_sender.send(Packet::Fin(transport.clone())).await;
+                    Some(Packet::FIN(_)) | None | Some(Packet::SYN(_)) => {
+                        let _ = relay.downstream_sender.send(Packet::FIN(transport.clone())).await;
                         return None;
                     }
                 }

@@ -60,8 +60,8 @@ class Packet:
 
     The max amount of bytes a packet may contain is bounded by `PACKET_DATA_SIZE`.
     """
-    connnection: Connection
-    payload: Literal["Syn", "Fin"] | bytes
+    connection: Connection
+    payload: Literal["SYN", "FIN"] | bytes
 
 type Signal = Literal["SIGTERM", "SIGUSR1", "SIGUSR2"]
 
@@ -69,30 +69,44 @@ class NodeEnd:
     """
     A pluggable slot on the node for connecting edges.
     """
-    def is_none(self) -> bool:
+    def connected(self) -> bool:
         """
-        `True` iff the slot is empty.
+        `True` iff the end is connected.
         """
-    def is_some(self) -> bool:
-        """
-        `True` iff the slot is connected.
-        """
-    def put_nowait(self, packet: Packet):
+    def put_nowait(self, packet: Packet) -> None:
         """
         Put a packet into the edge the node end is connected to.
 
         Raises exception if the end is empty, full, closed, 
         or if connection is full (back pressured).
         """
-    async def put(self, packet: Packet):
+    async def put(self, packet: Packet) -> None:
         """
         Put a packet into the edge the node end is connected to.
 
         Raises exception if the end is empty or closed.
         """
-    def __sub__(self, other: NodeEnd):
+    def __sub__(self, other: NodeEnd) -> None:
         """
         Connect the two node ends. (overwrites)
+        """
+
+class NodeInterface:
+    """
+    An upstream or downstream interface of a node.
+    
+    Conceptually an immutable list of `NodeEnd`s.
+    """
+    def __getitem__(self, index: int) -> NodeEnd:
+        ...
+    def __len__(self) -> int:
+            ...
+    def __sub__(self, other: NodeInterface) -> None:
+        """
+        Connects self disconnected slots to other disconnected slots in order,
+        until either side is full.
+
+        Does not overwrite existing connections.
         """
 
 class Node:
@@ -103,7 +117,6 @@ class Node:
     """
     upstreams: list[NodeEnd]
     downstreams: list[NodeEnd]
-    nodes: list[Node]
     def signal(self, signal: Signal):
         """
         Signal the node.
@@ -114,8 +127,8 @@ class Node:
         """
     def __rshift__(self, other: Node) -> Node:
         """
-        Connect all empty upstream node downstreams to downstream node upstreams
-        in order until either side is full, then adds.
+        Connect self downstreams to other upstreams,
+        then merges.
         """
     def __lshift__(self, other: Node) -> Node:
         """
@@ -127,10 +140,15 @@ class Node:
         or put a node into a graph,
         or merge the two graphs.
         """
+    def __sub__(self, other: Node):
+        """
+        Connects self downstream interface to other upstream interface.
+        """
 
 def GraphNode() -> Node:
     """
-    Graph, a special node.
+    Graph, a special node. Runtime node service manager.
 
-    A runtime node service manager.
+    The upstream / downstream interface of this node is a list of the aggregated ends
+    of its nodes.
     """

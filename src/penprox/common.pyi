@@ -1,5 +1,4 @@
 from collections.abc import Callable
-from enum import Enum, auto
 from ipaddress import IPv4Address, IPv6Address
 from typing import Literal
 
@@ -34,29 +33,6 @@ def UDPNode(address:
     - It has one upstream, no downstream.
     """
 
-class ChannelType(Enum):
-    Signal = auto()
-    Upstream = auto()
-    Downstream = auto()
-
-def PythonNode(
-        callback: Callable[[ChannelType, int, Signal | Packet], bool | Signal],
-        upstreams: int,
-        downstreams: int
-    ) -> Node:
-    """
-    A python node. This node can be used to simply attach a python service to
-    a graph, or listen to edge incoming packets.
-
-    The callback is invoked when a signal or packet arrives.
-    - If it returns a signal, the node quits and propagates the signal.
-    - If it returns `True`, the node returns silently.
-    - If it returns `False`, the node continues listening. (This is analogous to return 0.)
-
-    Note that the node must be properly connected as usual, and `SIGTERM` 
-    quits directly than invoking the callback.
-    """
-
 def DNSNode(
         resolver: str | IPv4Address | IPv6Address = IPv4Address("1.1.1.1"),  # noqa: B008
         middleware: bool = True,
@@ -82,4 +58,26 @@ def DNSNode(
     into the given address family. `V4V6` / `V6V4` are treated the same here.
     
     User may specify the size and TTL of the node-local DNS cache.
+    """
+
+type PythonNodeCallbackArg = tuple[Literal["Signal"], Literal[-1], Signal] | tuple[Literal["Upstream", "Downstream"], int, Packet]
+
+type PythonNodeCallback = Callable[[PythonNodeCallbackArg], bool | Signal]
+
+def PythonNode(
+        callback: PythonNodeCallback,
+        upstreams: int,
+        downstreams: int
+    ) -> Node:
+    """
+    A python node. This node can be used to simply attach a python service to
+    a graph, or listen to edge incoming packets.
+
+    The callback is invoked when a signal or packet arrives.
+    - If it returns a signal, the node quits and propagates the signal.
+    - If it returns `True`, the node returns silently.
+    - If it returns `False`, the node continues listening. (This is analogous to return 0.)
+
+    Note that the node must be properly connected as usual, and `SIGTERM` 
+    quits directly than invoking the callback.
     """

@@ -2,7 +2,7 @@
 pub mod sdk {
     use std::{any::Any, collections::HashMap, hash::{Hash, Hasher}, io::IsTerminal, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
     use async_trait::async_trait;
-    use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyFileNotFoundError, PyRuntimeError, PyValueError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
+use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyFileNotFoundError, PyRuntimeError, PyValueError, PyIndexError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
     use tokio::{sync::{Mutex as MutexTokio, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
@@ -324,87 +324,87 @@ pub mod sdk {
 
     #[derive(Debug)]
     pub enum Packet {
-        Syn(ConnectionToken),
+        SYN(ConnectionToken),
         Data(ConnectionAttached),
-        Fin(ConnectionToken)
+        FIN(ConnectionToken)
     }
 
     impl Packet {
         pub fn detach(self) -> DetachedPacket {
             match self {
-                Packet::Syn(connection) => DetachedPacket::Syn(connection),
+                Packet::SYN(connection) => DetachedPacket::SYN(connection),
                 Packet::Data(attached) => DetachedPacket::Data(attached.detach()),
-                Packet::Fin(connection) => DetachedPacket::Fin(connection)
+                Packet::FIN(connection) => DetachedPacket::FIN(connection)
             }
         }
         pub fn clone_detached(&self) -> DetachedPacket {
             match self {
-                Packet::Syn(connection) => DetachedPacket::Syn(connection.clone()),
+                Packet::SYN(connection) => DetachedPacket::SYN(connection.clone()),
                 Packet::Data(attached) => DetachedPacket::Data(ConnectionDetached {
                     connection: attached.connection().clone(),
                     data: attached.data.clone()
                 }),
-                Packet::Fin(connection) => DetachedPacket::Fin(connection.clone())
+                Packet::FIN(connection) => DetachedPacket::FIN(connection.clone())
             }
         }
         pub fn connection(&self) -> &ConnectionToken {
             match self {
-                Packet::Syn(token) => token,
+                Packet::SYN(token) => token,
                 Packet::Data(attached) => attached.connection(),
-                Packet::Fin(token) => token
+                Packet::FIN(token) => token
             }
         }
         pub fn is_syn(&self) -> bool {
-            matches!(self, Self::Syn(_))
+            matches!(self, Self::SYN(_))
         }
         pub fn is_data(&self) -> bool {
             matches!(self, Self::Data(_))
         }
         pub fn is_fin(&self) -> bool {
-            matches!(self, Self::Fin(_))
+            matches!(self, Self::FIN(_))
         }
     }
 
     #[derive(Clone, Debug)]
     pub enum DetachedPacket {
-        Syn(ConnectionToken),
+        SYN(ConnectionToken),
         Data(ConnectionDetached),
-        Fin(ConnectionToken)
+        FIN(ConnectionToken)
     }
 
     impl DetachedPacket {
         pub async fn attach(self) -> Packet {
             match self {
-                Self::Syn(connection) => Packet::Syn(connection),
+                Self::SYN(connection) => Packet::SYN(connection),
                 Self::Data(detached) => Packet::Data(detached.attach().await),
-                Self::Fin(connection) => Packet::Fin(connection)
+                Self::FIN(connection) => Packet::FIN(connection)
             }
         }
         pub fn try_attach(self) -> Result<Packet, Self> {
             match self {
-                Self::Syn(connection) => Ok(Packet::Syn(connection)),
+                Self::SYN(connection) => Ok(Packet::SYN(connection)),
                 Self::Data(detached) => match detached.try_attach() {
                     Ok(attached) => Ok(Packet::Data(attached)),
                     Err(detached) => Err(Self::Data(detached))
                 },
-                Self::Fin(connection) => Ok(Packet::Fin(connection))
+                Self::FIN(connection) => Ok(Packet::FIN(connection))
             }
         }
         pub fn connection(&self) -> &ConnectionToken {
             match self {
-                DetachedPacket::Syn(token) => token,
+                DetachedPacket::SYN(token) => token,
                 DetachedPacket::Data(attached) => &attached.connection,
-                DetachedPacket::Fin(token) => token
+                DetachedPacket::FIN(token) => token
             }
         }
         pub fn is_syn(&self) -> bool {
-            matches!(self, Self::Syn(_))
+            matches!(self, Self::SYN(_))
         }
         pub fn is_data(&self) -> bool {
             matches!(self, Self::Data(_))
         }
         pub fn is_fin(&self) -> bool {
-            matches!(self, Self::Fin(_))
+            matches!(self, Self::FIN(_))
         }
     }
 
@@ -413,9 +413,9 @@ pub mod sdk {
         fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
             match obj.extract::<PyPacket>() {
                 Ok(obj) => match obj.payload {
-                    PyPayload::Syn => Ok(DetachedPacket::Syn(obj.connection)),
+                    PyPayload::SYN => Ok(DetachedPacket::SYN(obj.connection)),
                     PyPayload::Data(data) => Ok(DetachedPacket::Data(ConnectionDetached { connection: obj.connection, data })),
-                    PyPayload::Fin => Ok(DetachedPacket::Fin(obj.connection))
+                    PyPayload::FIN => Ok(DetachedPacket::FIN(obj.connection))
                 },
                 _ => Err(PyValueError::new_err("Invalid packet"))
             }
@@ -428,31 +428,32 @@ pub mod sdk {
         type Output = Bound<'py, Self::Target>;
         fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
             let py_packet = match self {
-                Self::Syn(connection) => PyPacket {
+                Self::SYN(connection) => PyPacket {
                     connection,
-                    payload: PyPayload::Syn
+                    payload: PyPayload::SYN
                 },
                 Self::Data(detached) => PyPacket {
                     connection: detached.connection,
                     payload: PyPayload::Data(detached.data)
                 },
-                Self::Fin(connection) => PyPacket {
+                Self::FIN(connection) => PyPacket {
                     connection,
-                    payload: PyPayload::Fin
+                    payload: PyPayload::FIN
                 }
             };
             py_packet.into_bound_py_any(py)
         }
     }
 
-    /// Internal python payload type, as native `"Syn" | "Fin" | bytes`.
+    /// Internal python payload type, as native `"SYN" | "FIN" | bytes`.
     /// 
     /// This type already checks `PACKET_DATA_SIZE` on boundary.
     #[derive(Clone)]
+    #[allow(clippy::upper_case_acronyms)]
     enum PyPayload {
-        Syn,
+        SYN,
         Data(Box<[u8]>),
-        Fin
+        FIN
     }
 
     impl<'a, 'py> FromPyObject<'a, 'py> for PyPayload {
@@ -460,8 +461,8 @@ pub mod sdk {
         fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
             if let Ok(obj) = obj.cast::<PyString>() {
                 return match obj.to_str() {
-                    Ok("Syn") => Ok(Self::Syn),
-                    Ok("Fin") => Ok(Self::Fin),
+                    Ok("SYN") => Ok(Self::SYN),
+                    Ok("FIN") => Ok(Self::FIN),
                     _ => Err(PyValueError::new_err("Invalid flag string. Did you mean bytes?"))
                 }
             };
@@ -483,8 +484,8 @@ pub mod sdk {
         type Output = Bound<'py, Self::Target>;
         fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
             match self {
-                Self::Syn => Ok(PyString::new(py, "Syn").into_any()),
-                Self::Fin => Ok(PyString::new(py, "Fin").into_any()),
+                Self::SYN => Ok(PyString::new(py, "SYN").into_any()),
+                Self::FIN => Ok(PyString::new(py, "FIN").into_any()),
                 Self::Data(data) => Ok(PyBytes::new(py, &data).into_any())
             }
         }
@@ -623,73 +624,52 @@ pub mod sdk {
 
     #[derive(Debug)]
     struct NodeEnd {
-        receiver: Arc<MutexTokio<Receiver<Packet>>>, // This ArcMutex clones long held OwnedMutex token
-        sender: Sender<Packet>
+        sender: Sender<Packet>,
+        receiver: Arc<MutexTokio<Receiver<Packet>>> // This ArcMutex clones long held OwnedMutex token
     }
 
-    /// General representation of a node end.
-    /// 
-    /// A node end is a pluggable slot on the node.
-    #[pyclass(from_py_object)]
-    #[derive(Clone, Default, Debug)]
+    /// General representation of a node end. Can be empty (disconnected).
+    #[pyclass(from_py_object, name="NodeEnd")]
+    #[derive(Clone, Debug, Default)]
     pub struct NodeEndToken(Arc<MutexStd<Option<NodeEnd>>>); // This Mutex is always short held
 
     impl NodeEndToken {
+        /// Initialize a new, disconnected node end.
         pub fn new() -> Self {
-            Self::default()
-        }
-        pub fn set(&self, sender: Sender<Packet>, receiver: Receiver<Packet>) {
-            let mut guard = self.0.lock().expect("End is poisoned");
-            *guard = Some(NodeEnd {
-                receiver: Arc::new(MutexTokio::new(receiver)),
-                sender
-            })
+            Self(Arc::new(MutexStd::new(None)))
         }
         /// Get receiver.
-        /// 
-        /// Because of how often this is, it is already logged. You're welcome.
         pub fn sender(&self) -> Result<Sender<Packet>, TokenAccessError> {
             let guard = self.0.lock().expect("End is poisoned");
-            match guard.as_ref() {
-                Some(end) => Ok(end.sender.clone()),
-                None => {
-                    tracing::error!("End is empty");
-                    Err(TokenAccessError::Empty)
-                }
-            }
+            Ok(guard.as_ref().ok_or(TokenAccessError::Empty)?.sender.clone())
         }
         /// Get receiver.
-        /// 
-        /// Because of how often this is, it is already logged. You're welcome.
         pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<Packet>>, TokenAccessError> {
             let guard = self.0.lock().expect("End is poisoned");
-            match guard.as_ref() {
-                Some(node_end) => node_end.receiver.clone().try_lock_owned().map_err(|_| {
-                    tracing::error!("End is occupied");
-                    TokenAccessError::Occupied
-                }),
-                None => {
-                    tracing::error!("End is empty");
-                    Err(TokenAccessError::Empty)
-                }
-            }
+            guard.as_ref().ok_or(TokenAccessError::Empty)?.receiver.clone().try_lock_owned().map_err(|_| TokenAccessError::Occupied)
         }
-        /// Overwrites.
-        pub fn connect(first_end: &Self, second_end: &Self) {
+        /// Connect the two ends. Overwrites.
+        pub fn connect(&self, other: &Self) {
+            let mut slf = self.0.lock().expect("End is poisoned");
+            let mut other = other.0.lock().expect("End is poisoned");
             let (sender1, receiver1) = channel(PACKET_BUFFER_SIZE);
             let (sender2, receiver2) = channel(PACKET_BUFFER_SIZE);
-            first_end.set(sender1, receiver2);
-            second_end.set(sender2, receiver1);
+            *slf = Some(NodeEnd {
+                sender: sender1,
+                receiver: Arc::new(MutexTokio::new(receiver2))
+            });
+            *other = Some(NodeEnd {
+                sender: sender2,
+                receiver: Arc::new(MutexTokio::new(receiver1))
+            });
         }
     }
 
     #[pymethods]
     impl NodeEndToken {
-        pub fn is_none(&self) -> bool {
-            self.0.lock().expect("End is poisoned").is_none()
-        }
-        pub fn is_some(&self) -> bool {
-            self.0.lock().expect("End is poisoned").is_some()
+        pub fn connected(&self) -> bool {
+            let guard = self.0.lock().expect("End is poisoned");
+            guard.is_some()
         }
         fn put_nowait(&self, packet: DetachedPacket) -> PyResult<()> {
             let Ok(packet) = packet.try_attach() else {
@@ -717,7 +697,82 @@ pub mod sdk {
         }
         /// `NodeEndToken::connect`
         fn __sub__(&self, other: &Self) {
-            NodeEndToken::connect(self, other);
+            self.connect(other);
+        }
+    }
+
+    /// An immutable upstream / downstream interface of a node.
+    #[pyclass(from_py_object)]
+    #[derive(Clone, Debug)]
+    pub struct NodeInterface(Arc<MutexStd<Vec<NodeEndToken>>>); // This Mutex is always short held
+
+    impl NodeInterface {
+        pub fn new(ends: Vec<NodeEndToken>) -> Self {
+            Self(Arc::new(MutexStd::new(ends)))
+        
+        }
+        pub fn is_empty(&self) -> bool {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.is_empty()
+        }
+        pub fn len(&self) -> usize {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.len()
+        }
+        /// This is always `Some` unless index out of bounds
+        pub fn get(&self, index: usize) -> Option<NodeEndToken> {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.get(index).cloned()
+        }
+        /// Clone inside.
+        /// 
+        /// This is usually fine to use for immutable `NodeInterface`.
+        pub fn get_all(&self) -> Vec<NodeEndToken> {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.clone()
+        }
+        /// Connect two interfaces in order until either side is full. Does not overwrite connected ends.
+        pub fn connect(&self, other: &Self) -> Result<(), TokenAccessError> {
+            let self_disconnected_indices = {
+                let self_guard = self.0.lock().map_err(|_| TokenAccessError::Occupied)?;
+                let mut indices = Vec::new();
+                for (index, self_end) in self_guard.iter().enumerate() {
+                    if !self_end.connected() {
+                        indices.push(index);
+                    }
+                }
+                indices
+            };
+            let other_disconnected_indices = {
+                let other_guard = other.0.lock().map_err(|_| TokenAccessError::Occupied)?;
+                let mut indices = Vec::new();
+                for (index, other_end) in other_guard.iter().enumerate() {
+                    if !other_end.connected() {
+                        indices.push(index);
+                    }
+                }
+                indices
+            };
+            for (self_index, other_index) in self_disconnected_indices.into_iter().zip(other_disconnected_indices) {
+                let downstream = self.get(self_index).expect("Getting an out of bound enumerated index");
+                let upstream = other.get(other_index).expect("Getting an out of bound enumerated index");
+                NodeEndToken::connect(&downstream, &upstream);
+            }
+            Ok(())
+        }
+    }
+
+    #[pymethods]
+    impl NodeInterface {
+        fn __getitem__(&self, index: usize) -> PyResult<NodeEndToken> {
+            self.get(index).ok_or(PyIndexError::new_err("Node end index out of bounds"))
+        }
+        fn __len__(&self) -> usize {
+            self.len()
+        }
+        /// `NodeInterface::connect`
+        fn __sub__(&self, other: &Self) -> PyResult<()> {
+            self.connect(other).map_err(PyErr::from)
         }
     }
 
@@ -727,78 +782,36 @@ pub mod sdk {
     /// if necessary.
     #[async_trait]
     pub trait Node: Any + Send + std::fmt::Debug {
-        // It is indeed very unlikely this operation will fail
-        //
-        // But we need some escaping method otherwise they can only panic 
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError>;
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError>;
         async fn run(&mut self) -> Result<Option<Signal>, GraphError>;
     }
 
     /// General representation of a node.
-    /// 
-    /// The node lock is long held when running.
     #[pyclass(from_py_object, name="Node")]
     #[derive(Clone, Debug)]
     pub struct NodeToken {
         node: Arc<MutexTokio<Box<dyn Node>>>,
-        signal_sender: Sender<Signal>
+        signal_sender: Sender<Signal>,
+        upstreams: NodeInterface,
+        downstreams: NodeInterface
     }
 
     impl NodeToken {
-        pub fn new(node: Box<dyn Node>, signal_sender: Sender<Signal>) -> Self {
+        pub fn new(node: Box<dyn Node>, signal_sender: Sender<Signal>, upstreams: NodeInterface, downstreams: NodeInterface) -> Self {
             Self {
                 node: Arc::new(MutexTokio::new(node)),
-                signal_sender
+                signal_sender,
+                upstreams,
+                downstreams
             }
         }
-        /// Send signal.
-        pub fn signal(&self, signal: Signal) -> Result<(), TrySendError<Signal>> {
-            self.signal_sender.try_send(signal)
-        }
+        
         /// Lock & run as rust `Future`.
-        pub async fn run(&self) -> Result<Result<Option<Signal>, GraphError>, TokenAccessError> {
-            let mut guard = self.node.try_lock().or(Err(TokenAccessError::Occupied))?;
-            Ok(guard.as_mut().run().await)
-        }
-        /// `NodeEndToken::connect`, but you just provide index.
         /// 
-        /// Connects upstream node downstream end to downstream node upstream end.
-        pub fn connect(upstream_node: &mut Self, downstream_index: usize, downstream_node: &mut Self, upstream_index: usize) -> Result<(), TokenAccessError> {
-            let mut upstream_guard = upstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
-            let mut downstream_guard = downstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
-            let upstream_downstreams = upstream_guard.as_mut().downstreams()?;
-            let downstream_upstreams = downstream_guard.as_mut().upstreams()?;
-            NodeEndToken::connect(&upstream_downstreams[downstream_index], &downstream_upstreams[upstream_index]);
-            Ok(())
+        /// Returns occupied token error if node is already running.
+        pub async fn run(&self) -> Result<Result<Option<Signal>, GraphError>, TokenAccessError> {
+            Ok(self.node.try_lock().map_err(|_| TokenAccessError::Occupied)?.run().await)
         }
-        /// Connect upstream empty downstreams to downstream empty upstreams until either side is fully connected.
-        pub fn connect_all(upstream_node: &mut Self, downstream_node: &mut Self) -> Result<(), TokenAccessError> {
-            let empty_downstreams = {
-                let mut upstream_guard = upstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
-                let mut indices = Vec::new();
-                for (index, downstream) in upstream_guard.as_mut().downstreams()?.iter().enumerate() {
-                    if downstream.0.try_lock().or(Err(TokenAccessError::Occupied))?.is_none() {
-                        indices.push(index);
-                    }
-                }
-                indices
-            };
-            let empty_upstreams = {
-                let mut downstream_guard = downstream_node.node.try_lock().or(Err(TokenAccessError::Occupied))?;
-                let mut indices = Vec::new();
-                for (index, upstream) in downstream_guard.as_mut().upstreams()?.iter().enumerate() {
-                    if upstream.0.try_lock().or(Err(TokenAccessError::Occupied))?.is_none() {
-                        indices.push(index);
-                    }
-                }
-                indices
-            };
-            for (downstream_index, upstream_index) in empty_downstreams.into_iter().zip(empty_upstreams) {
-                Self::connect(upstream_node, downstream_index, downstream_node, upstream_index)?;
-            }
-            Ok(())
-        }
+
         /// Merge nodes or graphs.
         /// 
         /// If both have `nodes()`, nodes in second are stolen to first.
@@ -818,86 +831,65 @@ pub mod sdk {
             match (first_node.downcast_mut::<GraphNode>(), second_node.downcast_mut::<GraphNode>()) {
                 (Some(first_graph), Some(second_graph)) => {
                     first_graph.nodes().append(second_graph.nodes());
+                    first_graph.update_upstreams_downstreams(&first_token.upstreams, &first_token.downstreams);
+                    second_graph.update_upstreams_downstreams(&second_token.upstreams, &second_token.downstreams);
                     Ok(first_token)
                 }
                 (Some(first_graph), None) => {
                     first_graph.nodes().push(second_token);
+                    first_graph.update_upstreams_downstreams(&first_token.upstreams, &first_token.downstreams);
                     Ok(first_token)
                 }
                 (None, Some(second_graph)) => {
                     second_graph.nodes().insert(0, first_token);
+                    second_graph.update_upstreams_downstreams(&second_token.upstreams, &second_token.downstreams);
                     Ok(second_token)
                 }
-                (None, None) => Ok(GraphNode::new(Some(vec![first_token, second_token])))
+                (None, None) => Ok(GraphNode::new(vec![first_token, second_token]))
             }
         }
     }
 
     #[pymethods]
     impl NodeToken {
-        #[pyo3(name="signal")]
-        fn python_signal(&self, signal: Signal) -> PyResult<()> {
-            match self.signal_sender.try_send(signal){
-                Ok(()) => Ok(()),
-                Err(TrySendError::Closed(_)) => Err(PyRuntimeError::new_err("Signal receiver is closed")),
-                Err(TrySendError::Full(_)) => Err(PyRuntimeError::new_err("Signal receiver is full"))
-                
-            }
+        pub fn signal(&self, signal: Signal) {
+            let _ = self.signal_sender.try_send(signal); // Silently fail for this last resort
         }
-        /// A COPIED LIST of node upstreams.
         #[getter]
-        fn upstreams(&self) -> PyResult<Vec<NodeEndToken>> {
-            match self.node.try_lock().as_mut() {
-                Ok(node) => Ok(node.upstreams().map_err(|_| PyRuntimeError::new_err("Node is running"))?),
-                _ => Err(PyRuntimeError::new_err("Node is running"))
-            }
+        pub fn upstreams(&self) -> NodeInterface {
+            self.upstreams.clone()
         }
-        /// A COPIED LIST of node downstreams.
         #[getter]
-        fn downstreams(&self) -> PyResult<Vec<NodeEndToken>> {
-            match self.node.try_lock().as_mut() {
-                Ok(node) => Ok(node.downstreams().map_err(|_| PyRuntimeError::new_err("Node is running"))?),
-                _ => Err(PyRuntimeError::new_err("Node is running"))
-            }
-        }
-        /// A COPIED LIST of graph nodes.
-        /// 
-        /// Returns `None` if the node is not a graph.
-        #[getter]
-        fn nodes(&self) -> PyResult<Option<Vec<Self>>> {
-            let Ok(mut node) = self.node.try_lock() else {
-                return Err(PyRuntimeError::new_err("Node is running"))
-            };
-            let node_any: &mut dyn Any = &mut **node;
-            match node_any.downcast_mut::<GraphNode>() {
-                Some(graph) => Ok(Some(graph.nodes().clone())),
-                None => Ok(None)
-            }
+        pub fn downstreams(&self) -> NodeInterface {
+            self.downstreams.clone()
         }
         /// Hand over thread, spawn tokio runtime and run blocked.
         fn spawn(&self, py: Python<'_>) -> PyResult<Option<Signal>> {
-            let Ok(rt) = tokio::runtime::Runtime::new() else {
-                return Err(PyRuntimeError::new_err("Cannot spawn tokio runtime"))
-            };
+            let rt = tokio::runtime::Runtime::new().expect("Cannot spawn tokio runtime");
             py.detach(|| rt.block_on(self.run()))
                 .map_err(PyErr::from)?
                 .map_err(PyErr::from)
         }
-        fn __rshift__(&mut self, other: &mut Self) -> PyResult<Self> {
-            Self::connect_all(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        fn __add__(&self, other: &Self) -> PyResult<Self> {
             Self::merge(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))
         }
-        fn __lshift__(&mut self, other: &mut Self) -> PyResult<Self> {
+        fn __sub__(&self, other: &Self) -> PyResult<()> {
+            NodeInterface::connect(&self.downstreams, &other.upstreams).map_err(PyErr::from)
+        }
+        fn __rshift__(&self, other: &Self) -> PyResult<Self> {
+            self.__sub__(other)?;
+            self.__add__(other)
+        }
+        fn __lshift__(&self, other: &Self) -> PyResult<Self> {
             Self::__rshift__(other, self)
-        }
-        fn __add__(&mut self, other: &mut Self) -> PyResult<Self> {
-            Self::merge(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))
         }
     }
 
-    /// A node supporting hierarchical construction.
+    /// A special node supporting hierarchical construction.
     /// 
-    /// This node is implicitly constructed when two nodes merge.
+    /// This node is special in two ways:
+    /// 1. It changes the behaviour of merge;
+    /// 2. It has interfaces of variable length.
     #[pyclass]
     #[derive(Debug)]
     pub struct GraphNode {
@@ -907,24 +899,6 @@ pub mod sdk {
 
     #[async_trait]
     impl Node for GraphNode {
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            let mut upstreams = Vec::new();
-            for token in &self.nodes {
-                let mut guard = token.node.try_lock().map_err(|_| TokenAccessError::Occupied)?;
-                let node = guard.as_mut();
-                upstreams.extend(node.upstreams()?.iter().cloned());
-            }
-            Ok(upstreams)
-        }
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            let mut downstreams = Vec::new();
-            for token in &self.nodes {
-                let mut guard = token.node.try_lock().map_err(|_| TokenAccessError::Occupied)?;
-                let node = guard.as_mut();
-                downstreams.extend(node.downstreams()?.iter().cloned());
-            }
-            Ok(downstreams)
-        }
         #[tracing::instrument(name="GraphNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             self.signal_receiver.drain();
@@ -992,25 +966,49 @@ pub mod sdk {
         fn nodes(&mut self) -> &mut Vec<NodeToken> {
             &mut self.nodes
         }
+        fn update_upstreams_downstreams(&self, upstreams: &NodeInterface, downstreams: &NodeInterface) {
+            let mut new_upstreams = Vec::new();
+            let mut new_downstreams = Vec::new();
+            for node in &self.nodes {
+                let node_upstreams = node.upstreams.0.lock().expect("Interface is poisoned");
+                for upstream in &*node_upstreams {
+                    new_upstreams.push(upstream.clone());
+                }
+                let node_downstreams = node.downstreams.0.lock().expect("Interface is poisoned");
+                for downstream in &*node_downstreams {
+                    new_downstreams.push(downstream.clone());
+                }
+            }
+            let mut upstreams = upstreams.0.lock().expect("Interface is poisoned");
+            let mut downstreams = downstreams.0.lock().expect("Interface is poisoned");
+            *upstreams = new_upstreams;
+            *downstreams = new_downstreams;
+        }
     }
 
     #[pymethods]
     impl GraphNode {
         #[new]
-        #[pyo3(signature = (nodes = None))]
+        #[pyo3(signature = (nodes = Vec::new()))]
         #[allow(clippy::new_ret_no_self)]
-        pub fn new(nodes: Option<Vec<NodeToken>>) -> NodeToken {
+        pub fn new(nodes: Vec<NodeToken>) -> NodeToken {
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let graph_node = Self {
+                nodes,
+                signal_receiver
+            };
+            let upstreams = NodeInterface(Arc::new(MutexStd::new(Vec::new())));
+            let downstreams = NodeInterface(Arc::new(MutexStd::new(Vec::new())));
+            graph_node.update_upstreams_downstreams(&upstreams, &downstreams);
             NodeToken {
-                node: Arc::new(MutexTokio::new(Box::new(Self {
-                    nodes: nodes.unwrap_or_default(),
-                    signal_receiver
-                }))),
+                node: Arc::new(MutexTokio::new(Box::new(graph_node))),
                 signal_sender,
+                upstreams,
+                downstreams
             }
         }
     }
-    
+
     /// A python-compatible utility enum with "both" option.
     #[derive(Copy, Clone, Debug)]
     pub enum AddressMode {

@@ -37,7 +37,6 @@ where = ["src"]
 
 [[tool.setuptools-rust.ext-modules]]
 target = "penprox._src.penprox"
-path = "src/penprox/_src/Cargo.toml"
 binding = "PyO3"
 
 [tool.cibuildwheel]

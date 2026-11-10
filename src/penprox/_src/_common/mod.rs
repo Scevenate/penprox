@@ -1,11 +1,13 @@
+#![allow(clippy::all)]
+
 #[pyo3::pymodule(submodule)]
 pub mod common {
     use crate::_sdk::sdk::*;
-    use std::{collections::{HashMap, hash_map::RandomState}, hash::{BuildHasher, DefaultHasher, Hasher}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, pin::Pin, time::Duration};
+    use std::{collections::{HashMap, hash_map::RandomState}, hash::{BuildHasher, DefaultHasher, Hasher}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, time::Duration, pin::Pin};
     use async_trait::async_trait;
     use futures::future::select_all;
     use moka::future::Cache;
-    use pyo3::{FromPyObject, IntoPyObject, exceptions::PyValueError, prelude::*, pyclass, pymethods};
+    use pyo3::{FromPyObject, exceptions::PyValueError, prelude::*, pyclass, pymethods, types::PyString};
     use simple_dns::{CLASS, Name, Packet as DNSPacket, QCLASS, QTYPE, Question, TYPE, rdata::RData};
     use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, UdpSocket}, sync::{OwnedMutexGuard, mpsc::{Receiver, Sender, channel}}, task::JoinSet, time::{Instant, sleep_until}};
 
@@ -18,9 +20,9 @@ pub mod common {
     pub const DNS_BUFFER_SIZE: usize = 2048;
 
     /// Handler for a TCP connection. Dials the connection if no `stream` is
-    /// given, otherwise takes over the accepted stream and announces Syn.
+    /// given, otherwise takes over the accepted stream and announces SYN.
     /// 
-    /// Handles the entire lifetime of a connection (Syn, read, write and Fin).
+    /// Handles the entire lifetime of a connection (SYN, read, write and FIN).
     /// Unresolved domain connections are rejected. The handler does NOT check
     /// if receiver `Packet` belongs to the connection.
     /// 
@@ -29,7 +31,7 @@ pub mod common {
     /// at most `CONNECTION_BUFFER_SIZE - 1` `ConnectionAttached` may still exist.
     /// 
     /// Therefore, such buffer is guaranteed to be available if the sender is
-    /// aware of illegal packets (other than one `Fin`).
+    /// aware of illegal packets (other than one `FIN`).
     #[tracing::instrument(skip_all)]
     async fn tcp_handler(
         stream: Option<TcpStream>,
@@ -46,7 +48,7 @@ pub mod common {
             None => {
                 let Host::IpAddr(ip_addr) = connection.host() else {
                     tracing::debug!("Host is not resolved");
-                    if sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                    if sender.send(Packet::FIN(connection.clone())).await.is_err() {
                         return (connection, Some(Signal::SIGTERM));
                     }
                     return (connection, None);
@@ -58,14 +60,14 @@ pub mod common {
                     },
                     Ok(Err(error)) => {
                         tracing::debug!("Cannot connect to remote host: {error}");
-                        if sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                        if sender.send(Packet::FIN(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
                         return (connection, None);
                     },
                     _ => {
                         tracing::debug!("Cannot connect to remote host (timeout)");
-                        if sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                        if sender.send(Packet::FIN(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
                         return (connection, None);
@@ -74,7 +76,7 @@ pub mod common {
             }
         };
         let (mut reader, writer) = stream.into_split();
-        if announce && sender.send(Packet::Syn(connection.clone())).await.is_err() {
+        if announce && sender.send(Packet::SYN(connection.clone())).await.is_err() {
             return (connection, Some(Signal::SIGTERM));
         }
         // Separate read & write future to prevent `Packet::new` deadlock
@@ -85,21 +87,21 @@ pub mod common {
             let mut receiver = receiver;
             while let Some(packet) = receiver.recv().await {
                 match packet {
-                    Packet::Syn(connection) => {
+                    Packet::SYN(connection) => {
                         tracing::debug!("Received invalid SYN packet");
-                        if writer_sender.send(Packet::Fin(connection)).await.is_err() {
+                        if writer_sender.send(Packet::FIN(connection)).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
                         return None;
                     }
-                    Packet::Fin(_) => {
+                    Packet::FIN(_) => {
                         tracing::debug!("Connection closed (FIN)");
                         return None
                     },
                     Packet::Data(attached) => {
                         if !matches!(tokio::time::timeout(TCP_TIMEOUT, writer.write_all(&attached.data)).await, Ok(Ok(()))) { // ConnectionAttached is not dropped yet
                             tracing::debug!("Connection timed out");
-                            if writer_sender.send(Packet::Fin(writer_connection)).await.is_err() {
+                            if writer_sender.send(Packet::FIN(writer_connection)).await.is_err() {
                                 return Some(Signal::SIGTERM);
                             }
                             return None;
@@ -118,8 +120,8 @@ pub mod common {
                 },
                 read = tokio::time::timeout(TCP_TIMEOUT, reader.read(&mut buffer)) => match read {
                     Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
-                        tracing::debug!("Remote is irresponsive");
-                        if sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                        tracing::debug!("Remote is irresponsive!!");
+                        if sender.send(Packet::FIN(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
                         return (connection, None);
@@ -159,31 +161,33 @@ pub mod common {
         #[allow(clippy::new_ret_no_self)]
         pub fn new(address: Option<(IpAddr, u16)>) -> NodeToken {
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            NodeToken::new(
-                Box::new(Self {
-                    node_end: NodeEndToken::new(),
-                    signal_receiver,
-                    address: address.map(|(host, port)| SocketAddr::new(host, port))
-                }),
-                signal_sender
-            )
+            let node_end = NodeEndToken::new();
+            let tcp_node = Self {
+                node_end: node_end.clone(),
+                signal_receiver,
+                address: address.map(|(host, port)| SocketAddr::new(host, port))
+            };
+            if address.is_some() {
+                return NodeToken::new(
+                    Box::new(tcp_node),
+                    signal_sender,
+                    NodeInterface::new(Vec::new()),
+                    NodeInterface::new(vec![node_end])
+                )
+            } else {
+                return NodeToken::new(
+                    Box::new(tcp_node),
+                    signal_sender,
+                    NodeInterface::new(vec![node_end]),
+                    NodeInterface::new(Vec::new())
+
+                )
+            }
         }
     }
 
     #[async_trait]
     impl Node for TCPNode {
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.address {
-                Some(_) => Ok(Vec::new()),
-                None => Ok(vec![self.node_end.clone()])
-            }
-        }
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.address {
-                Some(_) => Ok(vec![self.node_end.clone()]),
-                None => Ok(Vec::new())
-            }
-        }
         #[tracing::instrument(name="TCPNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             let sender = self.node_end.sender().map_err(GraphError::from)?;
@@ -291,12 +295,12 @@ pub mod common {
                             packet = receiver.recv() => match packet {
                                 Some(packet) => {
                                     match packet {
-                                        Packet::Syn(connection) => {
+                                        Packet::SYN(connection) => {
                                             if dispatch.contains_key(&connection) {
                                                 tracing::debug!("Received SYN for existing connection {:?}, closing", connection);
                                                 let handler = dispatch.remove(&connection).expect("Unwrapping None that is some");
-                                                let _ = handler.send(Packet::Fin(connection.clone())).await;
-                                                if sender.send(Packet::Fin(connection)).await.is_err() {
+                                                let _ = handler.send(Packet::FIN(connection.clone())).await;
+                                                if sender.send(Packet::FIN(connection)).await.is_err() {
                                                     { tracing::error!("End closed"); return Err(GraphError::Disconnected) };
                                                 };
                                                 continue;
@@ -311,19 +315,19 @@ pub mod common {
                                                     let _ = handler.send(Packet::Data(attached)).await;
                                                 },
                                                 None => {
-                                                    if sender.send(Packet::Fin(attached.connection().clone())).await.is_err() {
+                                                    if sender.send(Packet::FIN(attached.connection().clone())).await.is_err() {
                                                         tracing::error!("updstream closed");
                                                         return Err(GraphError::Disconnected)
                                                     };
                                                 }
                                             };
                                         },
-                                        Packet::Fin(connection) => {
+                                        Packet::FIN(connection) => {
                                             if !dispatch.contains_key(&connection) {
                                                 continue;
                                             }
                                             let handler = dispatch.remove(&connection).expect("Removing non-existent key that is gettable");
-                                            let _ = handler.send(Packet::Fin(connection)).await;
+                                            let _ = handler.send(Packet::FIN(connection)).await;
                                         }
                                     }
                                     
@@ -368,31 +372,31 @@ pub mod common {
         #[allow(clippy::new_ret_no_self)]
         pub fn new(mode: UDPNodeMode) -> NodeToken {
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            NodeToken::new(
-                Box::new(Self {
-                    node_end: NodeEndToken::new(),
-                    signal_receiver,
-                    mode
-                }),
-                signal_sender
-            )
+            let node_end = NodeEndToken::new();
+            let udp_node = Self {
+                node_end: node_end.clone(),
+                signal_receiver,
+                mode
+            };
+            match mode {
+                UDPNodeMode::Upstream(..) => NodeToken::new(
+                    Box::new(udp_node),
+                    signal_sender,
+                    NodeInterface::new(Vec::new()),
+                    NodeInterface::new(vec![node_end])
+                ),
+                UDPNodeMode::Downstream(..) => NodeToken::new(
+                    Box::new(udp_node),
+                    signal_sender,
+                    NodeInterface::new(vec![node_end]),
+                    NodeInterface::new(Vec::new())
+                ),
+            }
         }
     }
 
     #[async_trait]
     impl Node for UDPNode {
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.mode {
-                UDPNodeMode::Upstream(_, _) => Ok(Vec::new()),
-                UDPNodeMode::Downstream(_) => Ok(vec![self.node_end.clone()])
-            }
-        }
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.mode {
-                UDPNodeMode::Upstream(_, _) => Ok(vec![self.node_end.clone()]),
-                UDPNodeMode::Downstream(_) => Ok(Vec::new())
-            }
-        }
         #[tracing::instrument(name="UDPNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             let sender = self.node_end.sender().map_err(GraphError::from)?;
@@ -445,30 +449,30 @@ pub mod common {
                         _ => continue
                     },
                     packet = receiver.recv() => match packet {
-                        Some(Packet::Syn(connection)) => {
+                        Some(Packet::SYN(connection)) => {
                             if matches!(mode, UDPNodeMode::Upstream(..)) {
-                                if sender.send(Packet::Fin(connection)).await.is_err() {
+                                if sender.send(Packet::FIN(connection)).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 };
                                 continue;
                             }
                             match connection.host() {
-                                Host::Domain(_) => if sender.send(Packet::Fin(connection)).await.is_err() {
+                                Host::Domain(_) => if sender.send(Packet::FIN(connection)).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 },
                                 Host::IpAddr(ip_addr) => { connections.insert(SocketAddr::new(ip_addr, connection.port()), (connection, Instant::now() + UDP_TIMEOUT)); }
                             };
                         }
-                        Some(Packet::Fin(connection)) => {
+                        Some(Packet::FIN(connection)) => {
                             if let Host::IpAddr(ip_addr) = connection.host() {
                                 connections.remove(&SocketAddr::new(ip_addr, connection.port()));
                             }
                         },
                         Some(Packet::Data(attached)) => {
                             match attached.connection().host() {
-                                Host::Domain(_) => if sender.send(Packet::Fin(attached.connection().clone())).await.is_err() {
+                                Host::Domain(_) => if sender.send(Packet::FIN(attached.connection().clone())).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 },
@@ -510,7 +514,7 @@ pub mod common {
                                     continue;
                                 };
                                 let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
-                                if sender.send(Packet::Syn(connection.clone())).await.is_err() {
+                                if sender.send(Packet::SYN(connection.clone())).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 };
@@ -545,7 +549,7 @@ pub mod common {
                                     continue;
                                 };
                                 let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
-                                if sender.send(Packet::Syn(connection.clone())).await.is_err() {
+                                if sender.send(Packet::SYN(connection.clone())).await.is_err() {
                                     tracing::error!("End closed");
                                     return Err(GraphError::Disconnected);
                                 };
@@ -574,164 +578,11 @@ pub mod common {
                             .collect();
                         for peer in expired {
                             if let Some((connection, _)) = connections.remove(&peer)
-                                && sender.send(Packet::Fin(connection)).await.is_err() {
+                                && sender.send(Packet::FIN(connection)).await.is_err() {
                                 tracing::error!("End closed");
                                 return Err(GraphError::Disconnected);
                             }
                         }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Python arg type
-    #[pyclass(skip_from_py_object)]
-    #[derive(Clone, Copy, Debug)]
-    enum ChannelType {
-        Signal,
-        Upstream,
-        Downstream
-    }
-
-    /// Python arg type
-    #[derive(IntoPyObject, Debug)]
-    enum DetachedPacketSignalError {
-        DetachedPacket(DetachedPacket),
-        Signal(Signal),
-        Error(())
-    }
-
-    /// Python return type
-    #[derive(FromPyObject, Debug)]
-    enum PythonCallbackReturnCode {
-        Control(bool),
-        Signal(Signal)
-    }
-
-    #[pyclass]
-    #[derive(Debug)]
-    pub struct PythonNode {
-        pub upstreams: Vec<NodeEndToken>,
-        pub downstreams: Vec<NodeEndToken>,
-        pub signal_receiver: Receiver<Signal>,
-        pub callback: Py<PyAny>
-    }
-
-    impl PythonNode {
-        #[allow(clippy::new_ret_no_self)]
-        pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> Result<NodeToken, &'static str> {
-            if !callback.is_callable() {
-                tracing::error!("Callback is not callable");
-                return Err("Callback is not callable");
-            }
-            let mut u = Vec::with_capacity(upstreams);
-            let mut d = Vec::with_capacity(downstreams);
-            u.resize_with(upstreams, NodeEndToken::new);
-            d.resize_with(downstreams, NodeEndToken::new);
-            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            Ok(NodeToken::new(
-                Box::new(Self {
-                    upstreams: u,
-                    downstreams: d,
-                    signal_receiver,
-                    callback: callback.unbind()
-                }),
-                signal_sender)
-            )
-        }
-    }
-
-    #[pymethods]
-    impl PythonNode {
-        #[new]
-        #[allow(clippy::new_ret_no_self)]
-        fn python_new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> PyResult<NodeToken> {
-            Self::new(callback, upstreams, downstreams).map_err(PyValueError::new_err)
-        }
-    }
-
-    #[async_trait]
-    impl Node for PythonNode {
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            Ok(self.upstreams.clone())
-        }
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            Ok(self.downstreams.clone())
-        }
-        #[tracing::instrument(name="PythonNode::run", skip_all)]
-        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
-            let mut upstreams = Vec::with_capacity(self.upstreams.len());
-            for upstream in &mut self.upstreams {
-                upstreams.push(upstream.receiver().map_err(GraphError::from)?
-                );
-            }
-            let mut downstreams = Vec::with_capacity(self.downstreams.len());
-            for downstream in &mut self.downstreams {
-                downstreams.push(downstream.receiver().map_err(GraphError::from)?);
-            }
-            loop {
-                let (channel_type, index, outcome) = {
-                    let mut node_ends: Vec<Pin<Box<dyn Future<Output = (ChannelType, usize, DetachedPacketSignalError)> + Send + '_>>> = Vec::with_capacity(upstreams.len() + downstreams.len());
-                    for (index, receiver) in upstreams.iter_mut().enumerate() {
-                        node_ends.push(Box::pin(async move {
-                            match receiver.recv().await {
-                                Some(packet) => (ChannelType::Upstream, index, DetachedPacketSignalError::DetachedPacket(packet.detach())),
-                                None => (ChannelType::Upstream, index, DetachedPacketSignalError::Error(())) // This error is mapped to actual error later in loop
-                            }
-                        }));
-                    }
-                    for (index, receiver) in downstreams.iter_mut().enumerate() {
-                        node_ends.push(Box::pin(async move {
-                            match receiver.recv().await {
-                                Some(packet) => (ChannelType::Downstream, index, DetachedPacketSignalError::DetachedPacket(packet.detach())),
-                                None => (ChannelType::Downstream, index, DetachedPacketSignalError::Error(()))
-                            }
-                        }));
-                    }
-                    if node_ends.is_empty() {
-                        match self.signal_receiver.recv().await {
-                            Some(signal) => (ChannelType::Signal, 0, DetachedPacketSignalError::Signal(signal)),
-                            None => {
-                                tracing::error!("Signal handle closed");
-                                return Err(GraphError::Disconnected)
-                            }
-                        }
-                    } else {
-                        tokio::select! {
-                            biased;
-                            signal = self.signal_receiver.recv() => match signal {
-                                Some(signal) => {
-                                    if signal == Signal::SIGTERM {
-                                        return Ok(None);
-                                    }
-                                    (ChannelType::Signal, 0, DetachedPacketSignalError::Signal(signal))
-                                },
-                                None => {
-                                    tracing::error!("Signal handle closed");
-                                    return Err(GraphError::Disconnected)
-                                }
-                            },
-                            packet = select_all(node_ends) => packet.0, // Cancel safe
-                        }
-                    }
-                };
-                if matches!(&outcome, DetachedPacketSignalError::Error(())) {
-                    tracing::error!("End is closed");
-                    return Err(GraphError::Disconnected);
-                }
-                let result = Python::attach(|py| {
-                    let channel_type = Py::new(py, channel_type)?;
-                    let object = self.callback.call1(py, (channel_type, index, outcome))?;
-                    object.bind(py).extract::<PythonCallbackReturnCode>()
-                });
-                match result {
-                    Ok(PythonCallbackReturnCode::Control(false)) => continue,
-                    Ok(PythonCallbackReturnCode::Control(true)) => return Ok(None),
-                    Ok(PythonCallbackReturnCode::Signal(signal)) => return Ok(Some(signal)),
-                    _ => {
-                        tracing::error!("Python callback returned invalid value {:?}", result);
-                        return Ok(Some(Signal::SIGTERM));
                     }
                 }
             }
@@ -768,7 +619,7 @@ pub mod common {
     ) -> bool {
         for connection in waiters {
             blocked.remove(&connection); // Drops packets
-            let packet = Packet::Fin(connection);
+            let packet = Packet::FIN(connection);
             if upstream_sender.send(packet).await.is_err() {
                 tracing::error!("End closed");
                 return true;
@@ -854,6 +705,7 @@ pub mod common {
                         None
                     })?;
                     let mut packet = DNSPacket::new_query(query.id);
+                    packet.set_flags(simple_dns::PacketFlag::RECURSION_DESIRED);
                     packet.questions.push(Question::new(name, (*qtype).into(), QCLASS::CLASS(CLASS::IN), false));
                     packet.build_bytes_vec_compressed().map_err(|_| {
                         tracing::debug!("c022d224-e635-4f41-993f-e8ac9b1cdb43"); // Yes, a random uuid because I'm not very sure when it will happen
@@ -924,28 +776,55 @@ pub mod common {
                 return Err("Invalid host");
             };
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            Ok(NodeToken::new(
-                Box::new(Self {
-                    upstream: NodeEndToken::new(),
-                    downstream: NodeEndToken::new(),
-                    resolver_downstream: match middleware {
-                        true => None,
-                        false => Some(NodeEndToken::new())
-                    },
-                    signal_receiver,
-                    resolver: SocketAddr::new(resolver, port),
-                    mode,
-                    cname_cache: Cache::builder()
-                        .max_capacity(size)
-                        .time_to_live(ttl)
-                        .build(),
-                    address_cache: Cache::builder()
-                        .max_capacity(size)
-                        .time_to_live(ttl)
-                        .build()
-                }),
-                signal_sender
-            ))
+            let upstream = NodeEndToken::new();
+            let downstream = NodeEndToken::new();
+            match middleware {
+                true => Ok(NodeToken::new(
+                    Box::new(Self {
+                        upstream: upstream.clone(),
+                        downstream: downstream.clone(),
+                        resolver_downstream: None,
+                        signal_receiver,
+                        resolver: SocketAddr::new(resolver, port),
+                        mode,
+                        cname_cache: Cache::builder()
+                            .max_capacity(size)
+                            .time_to_live(ttl)
+                            .build(),
+                        address_cache: Cache::builder()
+                            .max_capacity(size)
+                            .time_to_live(ttl)
+                            .build()
+                    }),
+                    signal_sender,
+                    NodeInterface::new(vec![upstream]),
+                    NodeInterface::new(vec![downstream])
+                )),
+                false => {
+                    let resolver_downstream = NodeEndToken::new();
+                    Ok(NodeToken::new(
+                        Box::new(Self {
+                            upstream: upstream.clone(),
+                            downstream: downstream.clone(),
+                            resolver_downstream: Some(resolver_downstream.clone()),
+                            signal_receiver,
+                            resolver: SocketAddr::new(resolver, port),
+                            mode,
+                            cname_cache: Cache::builder()
+                                .max_capacity(size)
+                                .time_to_live(ttl)
+                                .build(),
+                            address_cache: Cache::builder()
+                                .max_capacity(size)
+                                .time_to_live(ttl)
+                                .build()
+                        }),
+                        signal_sender,
+                        NodeInterface::new(vec![upstream]),
+                        NodeInterface::new(vec![downstream, resolver_downstream])
+                    ))
+                }
+            }
         }
     }
 
@@ -966,15 +845,6 @@ pub mod common {
 
     #[async_trait]
     impl Node for DNSNode {
-        fn upstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            Ok(vec![self.upstream.clone()])
-        }
-        fn downstreams(&self) -> Result<Vec<NodeEndToken>, TokenAccessError> {
-            match self.resolver_downstream.clone() {
-                None => Ok(vec![self.downstream.clone()]),
-                Some(end) => Ok(vec![self.downstream.clone(), end])
-            }
-        }
         #[tracing::instrument(name="DNSNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
             let upstream_sender = self.upstream.sender().map_err(GraphError::from)?;
@@ -997,7 +867,7 @@ pub mod common {
                     let resolver_sender = end.sender().map_err(GraphError::from)?;
                     let resolver_receiver = end.receiver().map_err(GraphError::from)?;
                     let resolver_connection = ConnectionToken::new(Host::IpAddr(self.resolver.ip()), Transport::UDP, self.resolver.port());
-                    if resolver_sender.send(Packet::Syn(resolver_connection.clone())).await.is_err() {
+                    if resolver_sender.send(Packet::SYN(resolver_connection.clone())).await.is_err() {
                         tracing::error!("End closed");
                         return Err(GraphError::Disconnected);
                     }
@@ -1034,7 +904,7 @@ pub mod common {
                     packet = upstream_receiver.recv() => match packet {
                         Some(packet) => {
                             let connection = packet.connection().clone();
-                            if matches!(packet, Packet::Syn(_)) && !connection.is_resolved() {
+                            if matches!(packet, Packet::SYN(_)) && !connection.is_resolved() {
                                 if let Some(packets) = blocked.get_mut(&connection) {
                                     packets.push(packet);
                                     continue;
@@ -1068,14 +938,14 @@ pub mod common {
                                         }
                                     }
                                     Some(None) => { // Negative cache hit
-                                        if upstream_sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                                        if upstream_sender.send(Packet::FIN(connection.clone())).await.is_err() {
                                             tracing::error!("End closed");
                                             return Err(GraphError::Disconnected);
                                         }
                                     }
                                     None => {
                                         let Some(name) = terminal else { // CNAME exhaustion (Only reachable by cycle)
-                                            if upstream_sender.send(Packet::Fin(connection.clone())).await.is_err() {
+                                            if upstream_sender.send(Packet::FIN(connection.clone())).await.is_err() {
                                                 tracing::error!("End closed");
                                                 return Err(GraphError::Disconnected);
                                             }
@@ -1210,6 +1080,169 @@ pub mod common {
                                 return Ok(Some(Signal::SIGTERM));
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Python arg type
+    #[derive(Clone, Copy, Debug)]
+    enum PythonCallbackChannelType {
+        Signal,
+        Upstream,
+        Downstream
+    }
+
+    impl<'py> IntoPyObject<'py> for PythonCallbackChannelType {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            match self {
+                Self::Signal => Ok(PyString::new(py, "Signal").into_any()),
+                Self::Upstream => Ok(PyString::new(py, "Upstream").into_any()),
+                Self::Downstream => Ok(PyString::new(py, "Downstream").into_any())
+            }
+        }
+    }
+
+    /// Python arg type
+    #[derive(IntoPyObject, Debug)]
+    enum PythonCallbackChannelObject {
+        DetachedPacket(DetachedPacket),
+        Signal(Signal),
+        Error(())
+    }
+
+    /// Python return type
+    #[derive(FromPyObject, Debug)]
+    enum PythonCallbackReturnCode {
+        Control(bool),
+        Signal(Signal)
+    }
+
+    #[pyclass]
+    #[derive(Debug)]
+    pub struct PythonNode {
+        pub upstreams: NodeInterface,
+        pub downstreams: NodeInterface,
+        pub signal_receiver: Receiver<Signal>,
+        pub callback: Py<PyAny>
+    }
+
+    impl PythonNode {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> Result<NodeToken, &'static str> {
+            if !callback.is_callable() {
+                tracing::error!("Callback is not callable");
+                return Err("Callback is not callable");
+            }
+            let mut u = Vec::with_capacity(upstreams);
+            let mut d = Vec::with_capacity(downstreams);
+            u.resize_with(upstreams, NodeEndToken::new);
+            d.resize_with(downstreams, NodeEndToken::new);
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let u = NodeInterface::new(u);
+            let d = NodeInterface::new(d);
+            Ok(NodeToken::new(
+                Box::new(Self {
+                    upstreams: u.clone(),
+                    downstreams: d.clone(),
+                    signal_receiver,
+                    callback: callback.unbind()
+                }),
+                signal_sender,
+                u,
+                d
+            ))
+        }
+    }
+
+    #[pymethods]
+    impl PythonNode {
+        #[new]
+        #[allow(clippy::new_ret_no_self)]
+        fn python_new<'py>(callback: Bound<'py, PyAny>, upstreams: usize, downstreams: usize) -> PyResult<NodeToken> {
+            Self::new(callback, upstreams, downstreams).map_err(PyValueError::new_err)
+        }
+    }
+
+    #[async_trait]
+    impl Node for PythonNode {
+        #[tracing::instrument(name="PythonNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let mut upstreams = Vec::with_capacity(self.upstreams.len());
+            for upstream in &mut self.upstreams.get_all() {
+                upstreams.push(upstream.receiver().map_err(GraphError::from)?
+                );
+            }
+            let mut downstreams = Vec::with_capacity(self.downstreams.len());
+            for downstream in &mut self.downstreams.get_all() {
+                downstreams.push(downstream.receiver().map_err(GraphError::from)?);
+            }
+            loop {
+                let (channel_type, channel_index, channel_object) = {
+                    let mut node_ends: Vec<Pin<Box<dyn Future<Output = (PythonCallbackChannelType, isize, PythonCallbackChannelObject)> + Send + '_>>> = Vec::with_capacity(upstreams.len() + downstreams.len());
+                    for (index, receiver) in upstreams.iter_mut().enumerate() {
+                        node_ends.push(Box::pin(async move {
+                            match receiver.recv().await {
+                                Some(packet) => (PythonCallbackChannelType::Upstream, index as isize, PythonCallbackChannelObject::DetachedPacket(packet.detach())),
+                                None => (PythonCallbackChannelType::Upstream, index as isize, PythonCallbackChannelObject::Error(())) // This error is mapped to actual error later in loop
+                            }
+                        }));
+                    }
+                    for (index, receiver) in downstreams.iter_mut().enumerate() {
+                        node_ends.push(Box::pin(async move {
+                            match receiver.recv().await {
+                                Some(packet) => (PythonCallbackChannelType::Downstream, index as isize, PythonCallbackChannelObject::DetachedPacket(packet.detach())),
+                                None => (PythonCallbackChannelType::Downstream, index as isize, PythonCallbackChannelObject::Error(()))
+                            }
+                        }));
+                    }
+                    if node_ends.is_empty() {
+                        match self.signal_receiver.recv().await {
+                            Some(signal) => (PythonCallbackChannelType::Signal, -1, PythonCallbackChannelObject::Signal(signal)),
+                            None => {
+                                tracing::error!("Signal handle closed");
+                                return Err(GraphError::Disconnected)
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            signal = self.signal_receiver.recv() => match signal {
+                                Some(signal) => {
+                                    if signal == Signal::SIGTERM {
+                                        return Ok(None);
+                                    }
+                                    (PythonCallbackChannelType::Signal, -1, PythonCallbackChannelObject::Signal(signal))
+                                },
+                                None => {
+                                    tracing::error!("Signal handle closed");
+                                    return Err(GraphError::Disconnected)
+                                }
+                            },
+                            packet = select_all(node_ends) => packet.0, // Cancel safe
+                        }
+                    }
+                };
+                if matches!(&channel_object, PythonCallbackChannelObject::Error(())) {
+                    tracing::error!("End is closed");
+                    return Err(GraphError::Disconnected);
+                }
+                let result = Python::attach(|py| {
+                    let argument = (channel_type, channel_index, channel_object).into_pyobject(py)?;
+                    let object = self.callback.call1(py, (argument,))?;
+                    object.bind(py).extract::<PythonCallbackReturnCode>()
+                });
+                match result {
+                    Ok(PythonCallbackReturnCode::Control(false)) => continue,
+                    Ok(PythonCallbackReturnCode::Control(true)) => return Ok(None),
+                    Ok(PythonCallbackReturnCode::Signal(signal)) => return Ok(Some(signal)),
+                    _ => {
+                        tracing::error!("Python callback returned invalid value {:?}", result);
+                        return Ok(Some(Signal::SIGTERM));
                     }
                 }
             }
