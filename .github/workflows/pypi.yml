@@ -3,7 +3,7 @@ name: pypi
 on:
   push:
     tags: 
-    - "v*"
+      - 'v*'
 
 jobs:
   build_wheels:
@@ -21,7 +21,7 @@ jobs:
           - macos-15-intel    # macosx x86_64
           - macos-15          # macosx arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         # Linux runs a container so rust is installed in pyproject [tool.cibuildwheel.linux].before-all.

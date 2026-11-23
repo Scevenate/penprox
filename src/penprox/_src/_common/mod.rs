@@ -1,13 +1,12 @@
-#![allow(clippy::all)]
-
 #[pyo3::pymodule(submodule)]
 pub mod common {
-    use crate::_sdk::sdk::*;
-    use std::{collections::{HashMap, hash_map::RandomState}, hash::{BuildHasher, DefaultHasher, Hasher}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, time::Duration, pin::Pin};
+    use crate::{_sdk::sdk::*, sdk::ConnectionDetached};
+    use std::{collections::{HashMap, hash_map::RandomState}, hash::{BuildHasher, DefaultHasher, Hasher}, io::{ErrorKind, Read, Write}, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
     use async_trait::async_trait;
     use futures::future::select_all;
     use moka::future::Cache;
-    use pyo3::{FromPyObject, exceptions::PyValueError, prelude::*, pyclass, pymethods, types::PyString};
+    use pyo3::{FromPyObject, exceptions::{PyFileNotFoundError, PyValueError}, prelude::*, pyclass, pymethods, types::PyString};
+    use rustls::{ClientConfig, ClientConnection, Connection as TLSConnection, RootCertStore, ServerConfig, ServerConnection, pki_types::{CertificateDer, PrivateKeyDer, ServerName}};
     use simple_dns::{CLASS, Name, Packet as DNSPacket, QCLASS, QTYPE, Question, TYPE, rdata::RData};
     use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, UdpSocket}, sync::{OwnedMutexGuard, mpsc::{Receiver, Sender, channel}}, task::JoinSet, time::{Instant, sleep_until}};
 
@@ -19,89 +18,155 @@ pub mod common {
     pub const DNS_CNAME_DEPTH: u8 = 16;
     pub const DNS_BUFFER_SIZE: usize = 2048;
 
-    /// Handler for a TCP connection. Dials the connection if no `stream` is
-    /// given, otherwise takes over the accepted stream and announces SYN.
-    /// 
-    /// Handles the entire lifetime of a connection (SYN, read, write and FIN).
-    /// Unresolved domain connections are rejected. The handler does NOT check
-    /// if receiver `Packet` belongs to the connection.
-    /// 
-    /// The buffer should be at least size `CONNECTION_BUFFER_SIZE`. The handler
-    /// will hold a `Packet::Data(ConnectionAttached)` while awaiting, meaning
-    /// at most `CONNECTION_BUFFER_SIZE - 1` `ConnectionAttached` may still exist.
-    /// 
-    /// Therefore, such buffer is guaranteed to be available if the sender is
-    /// aware of illegal packets (other than one `FIN`).
-    #[tracing::instrument(skip_all)]
-    async fn tcp_handler(
-        stream: Option<TcpStream>,
-        connection: ConnectionToken,
-        sender: Sender<Packet>,
-        receiver: Receiver<Packet>,
-    ) -> (ConnectionToken, Option<Signal>) {
-        let announce = stream.is_some();
-        let stream = match stream {
-            Some(stream) => {
-                tracing::debug!("Accepted new upstream connection");
-                stream
-            },
-            None => {
-                let Host::IpAddr(ip_addr) = connection.host() else {
-                    tracing::debug!("Host is not resolved");
-                    if sender.send(Packet::FIN(connection.clone())).await.is_err() {
-                        return (connection, Some(Signal::SIGTERM));
-                    }
-                    return (connection, None);
-                };
-                match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip_addr, connection.port()))).await {
-                    Ok(Ok(stream)) => {
-                        tracing::debug!("Established new downstream connection");
-                        stream
+    #[pyfunction]
+    #[pyo3(name = "TCPNode", signature = (address=None))]
+    fn tcp_node(address: Option<(IpAddr, u16)>) -> NodeToken {
+        match address {
+            Some(address) => TCPUpstreamNode::new(SocketAddr::new(address.0, address.1)),
+            None => TCPDownstreamNode::new()
+        }
+    }
+
+    /// Node for listening an upstream TCP port. Has one downstream.
+    #[derive(Debug)]
+    pub struct TCPUpstreamNode {
+        end: NodeDownstreamEndToken,
+        address: SocketAddr,
+        signal_receiver: Receiver<Signal>,
+    }
+
+    impl TCPUpstreamNode {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new(address: SocketAddr) -> NodeToken {
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let end = NodeDownstreamEndToken::new();
+            NodeToken::new(
+                Box::new(Self {
+                    end: end.clone(),
+                    address,
+                    signal_receiver
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![]),
+                NodeDownstreamInterface::new(vec![end])
+            )
+        }
+        pub fn address(&self) -> SocketAddr {
+            self.address
+        }
+    }
+
+    #[async_trait]
+    impl Node for TCPUpstreamNode {
+        #[tracing::instrument(name="TCPUpstreamNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let sender = self.end.sender().map_err(GraphError::from)?;
+            let mut receiver = self.end.receiver().map_err(GraphError::from)?;
+            self.signal_receiver.clear();
+            let listener = TcpListener::bind(self.address).await.map_err(|error| {
+                tracing::error!("Cannot bind address: {error}");
+                GraphError::NodeError
+            })?;
+            // write back ephermal port
+            self.address = listener.local_addr().map_err(|error| {
+                tracing::error!("Cannot get address: {error}");
+                GraphError::NodeError
+            })?;
+            #[allow(clippy::mutable_key_type)]
+            let mut dispatch: HashMap<ConnectionToken, Sender<UpwardPacket>> = HashMap::new();
+            let mut handlers: JoinSet<(ConnectionToken, Option<Signal>)> = JoinSet::new(); // This cancels on drop
+            loop {
+                tokio::select! {
+                    biased;
+                    signal = self.signal_receiver.recv() => match signal {
+                        Some(Signal::SIGTERM) => return Ok(None),
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
+                        _ => continue
                     },
-                    Ok(Err(error)) => {
-                        tracing::debug!("Cannot connect to remote host: {error}");
-                        if sender.send(Packet::FIN(connection.clone())).await.is_err() {
-                            return (connection, Some(Signal::SIGTERM));
-                        };
-                        return (connection, None);
+                    handler = handlers.join_next(), if !handlers.is_empty() => match handler {
+                        None => unreachable!("Awaiting non-empty join set that is empty"),
+                        Some(Err(error)) => {
+                            tracing::warn!("TCP handler join failed: {error}");
+                            continue;
+                        }
+                        Some(Ok((connection, signal))) => {
+                            dispatch.remove(&connection);
+                            if let Some(signal) = signal {
+                                tracing::debug!("Connection {:?} removed with signal {:?}, return & propagate", connection, signal);
+                                return Ok(Some(signal));
+                            }
+                            continue;
+                        }
                     },
-                    _ => {
-                        tracing::debug!("Cannot connect to remote host (timeout)");
-                        if sender.send(Packet::FIN(connection.clone())).await.is_err() {
-                            return (connection, Some(Signal::SIGTERM));
-                        };
-                        return (connection, None);
+                    packet = receiver.recv() => match packet {
+                        Some(packet) => {
+                            if let Some(handler) = dispatch.get(packet.connection()) {
+                                let _ = handler.try_send(packet); // No good countermeasure for this never condition
+                            }
+                        },
+                        None => {
+                            tracing::error!("Downstream closed");
+                            return Err(GraphError::Disconnected);
+                        }
+                    },
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, peer)) => {
+                            let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::TCP, peer.port());
+                            let (dispatch_sender, dispatch_receiver) = channel(CONNECTION_BUFFER_SIZE);
+                            dispatch.insert(connection.clone(), dispatch_sender);
+                            handlers.spawn(tcp_upstream_handler(
+                                connection,
+                                stream,
+                                dispatch_receiver,
+                                sender.clone()
+                            ));
+                        },
+                        Err(error) => {
+                            tracing::warn!("TCP accept failed: {error}");
+                            continue;
+                        }
                     }
                 }
             }
-        };
+
+        }
+    }
+
+    #[tracing::instrument(name="tcp_upstream_handler", skip_all)]
+    async fn tcp_upstream_handler(
+        connection: ConnectionToken,
+        stream: TcpStream,
+        dispatch: Receiver<UpwardPacket>,
+        sender: Sender<DownwardPacket>
+    ) -> (ConnectionToken, Option<Signal>) {
         let (mut reader, writer) = stream.into_split();
-        if announce && sender.send(Packet::SYN(connection.clone())).await.is_err() {
+        if sender.send(DownwardPacket::SYN(connection.clone())).await.is_err() {
             return (connection, Some(Signal::SIGTERM));
         }
-        // Separate read & write future to prevent `Packet::new` deadlock
         let writer_sender = sender.clone();
         let writer_connection = connection.clone();
         let mut writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
             let mut writer = writer;
-            let mut receiver = receiver;
+            let mut receiver = dispatch;
             while let Some(packet) = receiver.recv().await {
                 match packet {
-                    Packet::SYN(connection) => {
+                    UpwardPacket::SYN(connection) => {
                         tracing::debug!("Received invalid SYN packet");
-                        if writer_sender.send(Packet::FIN(connection)).await.is_err() {
+                        if writer_sender.send(DownwardPacket::FIN(connection)).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
                         return None;
                     }
-                    Packet::FIN(_) => {
-                        tracing::debug!("Connection closed (FIN)");
+                    UpwardPacket::FIN(_) => {
+                        tracing::debug!("Connection to {:?} closed (FIN)", writer_connection.host());
                         return None
                     },
-                    Packet::Data(attached) => {
-                        if !matches!(tokio::time::timeout(TCP_TIMEOUT, writer.write_all(&attached.data)).await, Ok(Ok(()))) { // ConnectionAttached is not dropped yet
-                            tracing::debug!("Connection timed out");
-                            if writer_sender.send(Packet::FIN(writer_connection)).await.is_err() {
+                    UpwardPacket::Data(attached) => {
+                        if !matches!(tokio::time::timeout(TCP_TIMEOUT, writer.write_all(&attached.data)).await, Ok(Ok(()))) {
+                            if writer_sender.send(DownwardPacket::FIN(writer_connection)).await.is_err() {
                                 return Some(Signal::SIGTERM);
                             }
                             return None;
@@ -119,16 +184,23 @@ pub mod common {
                     return (connection, result.ok().flatten());
                 },
                 read = tokio::time::timeout(TCP_TIMEOUT, reader.read(&mut buffer)) => match read {
-                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
-                        tracing::debug!("Remote is irresponsive!!");
-                        if sender.send(Packet::FIN(connection.clone())).await.is_err() {
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::debug!("Remote is irresponsive");
+                        if sender.send(DownwardPacket::FIN(connection.clone())).await.is_err() {
+                            return (connection, Some(Signal::SIGTERM));
+                        };
+                        return (connection, None);
+                    }
+                    Ok(Ok(0)) => {
+                        tracing::debug!("Connection to {:?} closed", connection.host());
+                        if sender.send(DownwardPacket::FIN(connection.clone())).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         };
                         return (connection, None);
                     }
                     Ok(Ok(count)) => {
                         let data = buffer[..count].to_vec().into_boxed_slice();
-                        if sender.send(Packet::Data(connection.attach(data).await)).await.is_err() {
+                        if sender.send(DownwardPacket::Data(ConnectionDownward::new(connection.clone(), data).await)).await.is_err() {
                             return (connection, Some(Signal::SIGTERM));
                         }
                     }
@@ -137,203 +209,198 @@ pub mod common {
         }
     }
 
-    /// Node for TCP, may listen a port. Doesn't support DNS.
-    ///
-    /// When provided `(ip, port)`, the node is in upstream mode:
-    /// - The node listens to the port.
-    /// - It has one downstream, no upstream.
-    /// - It does not support downstream SYNs.
-    /// 
-    /// When provided `None`, the node is in downstream mode:
-    /// - It has one upstream, no downstream.
-    #[pyclass]
+    
+    /// Node for serving downstream TCP connections. Has one upstream.
     #[derive(Debug)]
-    pub struct TCPNode {
-        node_end: NodeEndToken,
+    pub struct TCPDownstreamNode {
+        end: NodeUpstreamEndToken,
         signal_receiver: Receiver<Signal>,
-        address: Option<SocketAddr>
     }
 
-    #[pymethods]
-    impl TCPNode {
-        #[new]
-        #[pyo3(signature = (address = None))]
+    impl TCPDownstreamNode {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new(address: Option<(IpAddr, u16)>) -> NodeToken {
+        pub fn new() -> NodeToken {
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            let node_end = NodeEndToken::new();
-            let tcp_node = Self {
-                node_end: node_end.clone(),
-                signal_receiver,
-                address: address.map(|(host, port)| SocketAddr::new(host, port))
-            };
-            if address.is_some() {
-                return NodeToken::new(
-                    Box::new(tcp_node),
-                    signal_sender,
-                    NodeInterface::new(Vec::new()),
-                    NodeInterface::new(vec![node_end])
-                )
-            } else {
-                return NodeToken::new(
-                    Box::new(tcp_node),
-                    signal_sender,
-                    NodeInterface::new(vec![node_end]),
-                    NodeInterface::new(Vec::new())
-
-                )
-            }
+            let end = NodeUpstreamEndToken::new();
+            NodeToken::new(
+                Box::new(Self {
+                    end: end.clone(),
+                    signal_receiver
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![end]),
+                NodeDownstreamInterface::new(vec![])
+            )
         }
     }
 
     #[async_trait]
-    impl Node for TCPNode {
-        #[tracing::instrument(name="TCPNode::run", skip_all)]
+    impl Node for TCPDownstreamNode {
+        #[tracing::instrument(name="TCPDownstreamNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
-            let sender = self.node_end.sender().map_err(GraphError::from)?;
-            let mut receiver = self.node_end.receiver().map_err(GraphError::from)?;
-            self.signal_receiver.drain();
-            match self.address {
-                Some(address) => { // TCPNode: upstream mode
-                    let listener = TcpListener::bind(address).await.map_err(|error| {
-                        tracing::error!("Cannot bind address: {error}");
-                        GraphError::NodeError
-                    })?;
-                    self.address = Some(listener.local_addr().map_err(|error| {
-                        tracing::error!("Cannot get address: {error}");
-                        GraphError::NodeError
-                    })?);
-                    #[allow(clippy::mutable_key_type)]
-                    let mut dispatch: HashMap<ConnectionToken, Sender<Packet>> = HashMap::new();
-                    let mut handlers: JoinSet<(ConnectionToken, Option<Signal>)> = JoinSet::new(); // This cancels on drop
-                    loop {
-                        tokio::select! {
-                            biased;
-                            signal = self.signal_receiver.recv() => match signal {
-                                Some(Signal::SIGTERM) => return Ok(None),
-                                None => {
-                                    tracing::error!("Signal receiver is closed");
-                                    return Err(GraphError::Disconnected)
-                                },
-                                _ => continue
-                            },
-                            handler = handlers.join_next(), if !handlers.is_empty() => match handler {
-                                None => unreachable!("Awaiting non-empty join set that is empty"),
-                                Some(Err(error)) => {
-                                    tracing::warn!("Node handler task failed: {error}");
-                                    continue;
-                                }
-                                Some(Ok((connection, signal))) => {
-                                    dispatch.remove(&connection);
-                                    if let Some(signal) = signal {
-                                        tracing::debug!("Connection {:?} removed with signal {:?}, return & propagate", connection, signal);
-                                        return Ok(Some(signal));
+            let sender = self.end.sender().map_err(GraphError::from)?;
+            let mut receiver = self.end.receiver().map_err(GraphError::from)?;
+            self.signal_receiver.clear();
+            #[allow(clippy::mutable_key_type)]
+            let mut dispatch: HashMap<ConnectionToken, Sender<DownwardPacket>> = HashMap::new();
+            let mut handlers: JoinSet<(ConnectionToken, Option<Signal>)> = JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    signal = self.signal_receiver.recv() => match signal {
+                        Some(Signal::SIGTERM) => return Ok(None),
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
+                        _ => continue
+                    },
+                    handler = handlers.join_next(), if !handlers.is_empty() => match handler {
+                        None => unreachable!("Awaiting non-empty join set that is empty"),
+                        Some(Err(error)) => {
+                            tracing::warn!("Node handler task failed: {error}");
+                            continue;
+                        }
+                        Some(Ok((connection, signal))) => {
+                            dispatch.remove(&connection);
+                            if let Some(signal) = signal {
+                                return Ok(Some(signal));
+                            }
+                            continue;
+                        }
+                    },
+                    packet = receiver.recv() => match packet {
+                        Some(packet) => {
+                            match packet {
+                                DownwardPacket::SYN(connection) => {
+                                    if dispatch.contains_key(&connection) {
+                                        tracing::debug!("Received SYN for existing connection {:?}, closing", connection);
+                                        let handler = dispatch.remove(&connection).expect("Unwrapping None that is some");
+                                        let _ = handler.send(DownwardPacket::FIN(connection.clone())).await; // Violates standard behaviour
+                                        sender.send(UpwardPacket::FIN(connection)).await?;
+                                        continue;
                                     }
-                                    continue;
-                                }
-                            },
-                            packet = receiver.recv() => match packet {
-                                Some(packet) => {
-                                    if let Some(handler) = dispatch.get(packet.connection()) {
-                                        let _ = handler.send(packet).await; // No good countermeasure for this never condition
-                                    }
-                                },
-                                None => {
-                                    tracing::error!("Downstream closed");
-                                    return Err(GraphError::Disconnected);
-                                }
-                            },
-                            accepted = listener.accept() => match accepted {
-                                Ok((stream, peer)) => {
-                                    let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::TCP, peer.port());
                                     let (dispatch_sender, dispatch_receiver) = channel(CONNECTION_BUFFER_SIZE);
                                     dispatch.insert(connection.clone(), dispatch_sender);
-                                    handlers.spawn(tcp_handler(
-                                        Some(stream),
-                                        connection,
-                                        sender.clone(),
-                                        dispatch_receiver
-                                    ));
+                                    handlers.spawn(tcp_downstream_handler(connection.clone(), dispatch_receiver, sender.clone()));
                                 },
-                                Err(error) => {
-                                    tracing::warn!("TCP accept failed: {error}");
-                                    continue;
+                                DownwardPacket::Data(downward) => {
+                                    match dispatch.get(downward.connection()) {
+                                        Some(handler) => {
+                                            let _ = handler.send(DownwardPacket::Data(downward)).await;
+                                        },
+                                        None => {
+                                            sender.send(UpwardPacket::FIN(downward.connection().clone())).await?;
+                                        }
+                                    };
+                                },
+                                DownwardPacket::FIN(connection) => {
+                                    if !dispatch.contains_key(&connection) {
+                                        continue;
+                                    }
+                                    let handler = dispatch.remove(&connection).expect("Removing non-existent key that is gettable");
+                                    let _ = handler.send(DownwardPacket::FIN(connection)).await;
                                 }
                             }
+                            
+                        }
+                        None => return Ok(None)
+                    }
+                }
+            }
+        }
+    }
+
+    #[tracing::instrument(name="tcp_downstream_handler", skip_all)]
+    async fn tcp_downstream_handler(
+        connection: ConnectionToken,
+        dispatch: Receiver<DownwardPacket>,
+        sender: Sender<UpwardPacket>
+    ) -> (ConnectionToken, Option<Signal>) {
+        let Host::IpAddr(ip_addr) = connection.host() else {
+            tracing::debug!("Host is not resolved");
+            if sender.send(UpwardPacket::FIN(connection.clone())).await.is_err() {
+                return (connection, Some(Signal::SIGTERM));
+            }
+            return (connection, None);
+        };
+        let stream = match tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip_addr, connection.port()))).await {
+            Ok(Ok(stream)) => {
+                tracing::debug!("Established new downstream connection");
+                stream
+            },
+            Ok(Err(error)) => {
+                tracing::debug!("Cannot connect to remote host: {error}");
+                if sender.send(UpwardPacket::FIN(connection.clone())).await.is_err() {
+                    return (connection, Some(Signal::SIGTERM));
+                };
+                return (connection, None);
+            },
+            _ => {
+                tracing::debug!("Cannot connect to remote host (timeout)");
+                if sender.send(UpwardPacket::FIN(connection.clone())).await.is_err() {
+                    return (connection, Some(Signal::SIGTERM));
+                };
+                return (connection, None);
+            }
+        };
+        let (mut reader, writer) = stream.into_split();
+        let writer_sender = sender.clone();
+        let writer_connection = connection.clone();
+        let mut writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut writer = writer;
+            let mut receiver = dispatch;
+            while let Some(packet) = receiver.recv().await {
+                match packet {
+                    DownwardPacket::SYN(connection) => {
+                        tracing::debug!("Received invalid SYN packet");
+                        if writer_sender.send(UpwardPacket::FIN(connection)).await.is_err() {
+                            return Some(Signal::SIGTERM);
+                        }
+                        return None;
+                    }
+                    DownwardPacket::FIN(_) => {
+                        tracing::debug!("Connection to {:?} closed (FIN)", writer_connection.host());
+                        return None
+                    },
+                    DownwardPacket::Data(attached) => {
+                        if !matches!(tokio::time::timeout(TCP_TIMEOUT, writer.write_all(&attached.data)).await, Ok(Ok(()))) {
+                            if writer_sender.send(UpwardPacket::FIN(writer_connection)).await.is_err() {
+                                return Some(Signal::SIGTERM);
+                            }
+                            return None;
                         }
                     }
                 }
-                None => { // TCPNode: downstream mode
-                    #[allow(clippy::mutable_key_type)]
-                    let mut dispatch: HashMap<ConnectionToken, Sender<Packet>> = HashMap::new();
-                    let mut handlers: JoinSet<(ConnectionToken, Option<Signal>)> = JoinSet::new();
-                    loop {
-                        tokio::select! {
-                            biased;
-                            signal = self.signal_receiver.recv() => match signal {
-                                Some(Signal::SIGTERM) => return Ok(None),
-                                None => {
-                                    tracing::error!("Signal receiver is closed");
-                                    return Err(GraphError::Disconnected)
-                                },
-                                _ => continue
-                            },
-                            handler = handlers.join_next(), if !handlers.is_empty() => match handler {
-                                None => unreachable!("Awaiting non-empty join set that is empty"),
-                                Some(Err(error)) => {
-                                    tracing::warn!("Node handler task failed: {error}");
-                                    continue;
-                                }
-                                Some(Ok((connection, signal))) => {
-                                    dispatch.remove(&connection);
-                                    if let Some(signal) = signal {
-                                        return Ok(Some(signal));
-                                    }
-                                    continue;
-                                }
-                            },
-                            packet = receiver.recv() => match packet {
-                                Some(packet) => {
-                                    match packet {
-                                        Packet::SYN(connection) => {
-                                            if dispatch.contains_key(&connection) {
-                                                tracing::debug!("Received SYN for existing connection {:?}, closing", connection);
-                                                let handler = dispatch.remove(&connection).expect("Unwrapping None that is some");
-                                                let _ = handler.send(Packet::FIN(connection.clone())).await;
-                                                if sender.send(Packet::FIN(connection)).await.is_err() {
-                                                    { tracing::error!("End closed"); return Err(GraphError::Disconnected) };
-                                                };
-                                                continue;
-                                            }
-                                            let (dispatch_sender, dispatch_receiver) = channel(CONNECTION_BUFFER_SIZE);
-                                            dispatch.insert(connection.clone(), dispatch_sender);
-                                            handlers.spawn(tcp_handler(None, connection.clone(), sender.clone(), dispatch_receiver));
-                                        },
-                                        Packet::Data(attached) => {
-                                            match dispatch.get(attached.connection()) {
-                                                Some(handler) => {
-                                                    let _ = handler.send(Packet::Data(attached)).await;
-                                                },
-                                                None => {
-                                                    if sender.send(Packet::FIN(attached.connection().clone())).await.is_err() {
-                                                        tracing::error!("updstream closed");
-                                                        return Err(GraphError::Disconnected)
-                                                    };
-                                                }
-                                            };
-                                        },
-                                        Packet::FIN(connection) => {
-                                            if !dispatch.contains_key(&connection) {
-                                                continue;
-                                            }
-                                            let handler = dispatch.remove(&connection).expect("Removing non-existent key that is gettable");
-                                            let _ = handler.send(Packet::FIN(connection)).await;
-                                        }
-                                    }
-                                    
-                                }
-                                None => return Ok(None)
-                            }
+            }
+            Some(Signal::SIGTERM)
+        }));
+        let mut buffer = [0u8; PACKET_DATA_SIZE];
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut writer_task => {
+                    return (connection, result.ok().flatten());
+                },
+                read = tokio::time::timeout(TCP_TIMEOUT, reader.read(&mut buffer)) => match read {
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::debug!("Remote is irresponsive");
+                        if sender.send(UpwardPacket::FIN(connection.clone())).await.is_err() {
+                            return (connection, Some(Signal::SIGTERM));
+                        };
+                        return (connection, None);
+                    }
+                    Ok(Ok(0)) => {
+                        tracing::debug!("Connection to {:?} closed", connection.host());
+                        if sender.send(UpwardPacket::FIN(connection.clone())).await.is_err() {
+                            return (connection, Some(Signal::SIGTERM));
+                        };
+                        return (connection, None);
+                    }
+                    Ok(Ok(count)) => {
+                        let data = buffer[..count].to_vec().into_boxed_slice();
+                        if sender.send(UpwardPacket::Data(ConnectionUpward::new(connection.clone(), data).await)).await.is_err() {
+                            return (connection, Some(Signal::SIGTERM));
                         }
                     }
                 }
@@ -342,96 +409,194 @@ pub mod common {
     }
 
     #[derive(Clone, Copy, FromPyObject, Debug)]
-    pub enum UDPNodeMode {
+    enum UDPNodeMode {
         Upstream(IpAddr, u16),
         Downstream(AddressMode)
     }
 
-    /// Node for UDP, may bind a port. Doesn't support DNS.
-    ///
-    /// When provided `(ip, port)`, the node is in upstream mode:
-    /// - The node listens to the port.
-    /// - It has one downstream, no upstream.
-    /// - It does not support downstream SYNs.
-    /// 
-    /// When provided `V4V6 | V6V4 | V4 | V6`, the node is in downstream mode:
-    /// - It binds ephemeral v4 | v6 | v4&v6 port(s). (`V4V6` and `V6V4` are treated the same here).
-    /// - It has one upstream, no downstream.
-    #[pyclass]
-    #[derive(Debug)]
-    pub struct UDPNode {
-        node_end: NodeEndToken,
-        signal_receiver: Receiver<Signal>,
-        mode: UDPNodeMode
+    #[pyfunction]
+    #[pyo3(name = "UDPNode", signature = (mode=UDPNodeMode::Downstream(AddressMode::V4V6)))]
+    fn udp_node(mode: UDPNodeMode) -> NodeToken {
+        match mode {
+            UDPNodeMode::Upstream(ip, port) => UDPUpstreamNode::new(SocketAddr::new(ip, port)),
+            UDPNodeMode::Downstream(mode) => UDPDownstreamNode::new(mode)
+        }
     }
 
-    #[pymethods]
-    impl UDPNode {
-        #[new]
-        #[pyo3(signature = (mode = UDPNodeMode::Downstream(AddressMode::V4V6)))]
+    /// Upstream UDP node that binds a port. Has one downstream.
+    #[derive(Debug)]
+    pub struct UDPUpstreamNode {
+        end: NodeDownstreamEndToken,
+        signal_receiver: Receiver<Signal>,
+        address: SocketAddr
+    }
+
+    impl UDPUpstreamNode {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new(mode: UDPNodeMode) -> NodeToken {
+        pub fn new(address: SocketAddr) -> NodeToken {
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            let node_end = NodeEndToken::new();
-            let udp_node = Self {
-                node_end: node_end.clone(),
-                signal_receiver,
-                mode
-            };
-            match mode {
-                UDPNodeMode::Upstream(..) => NodeToken::new(
-                    Box::new(udp_node),
-                    signal_sender,
-                    NodeInterface::new(Vec::new()),
-                    NodeInterface::new(vec![node_end])
-                ),
-                UDPNodeMode::Downstream(..) => NodeToken::new(
-                    Box::new(udp_node),
-                    signal_sender,
-                    NodeInterface::new(vec![node_end]),
-                    NodeInterface::new(Vec::new())
-                ),
-            }
+            let end = NodeDownstreamEndToken::new();
+            NodeToken::new(
+                Box::new(Self {
+                    end: end.clone(),
+                    signal_receiver,
+                    address
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![]),
+                NodeDownstreamInterface::new(vec![end])
+            )
+        }
+        pub fn address(&self) -> SocketAddr {
+            self.address
         }
     }
 
     #[async_trait]
-    impl Node for UDPNode {
-        #[tracing::instrument(name="UDPNode::run", skip_all)]
+    impl Node for UDPUpstreamNode {
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
-            let sender = self.node_end.sender().map_err(GraphError::from)?;
-            let mut receiver = self.node_end.receiver().map_err(GraphError::from)?;
-            self.signal_receiver.drain();
-            let mode = self.mode;
-            let (socket_v4, socket_v6) = match mode {
-                UDPNodeMode::Upstream(host, port) => {
-                    let socket = UdpSocket::bind(SocketAddr::new(host, port)).await.map_err(|error| {
-                        tracing::error!("Cannot bind address: {error}");
-                        GraphError::NodeError
-                    })?;
-                    match host {
-                        IpAddr::V4(_) => (Some(socket), None),
-                        IpAddr::V6(_) => (None, Some(socket))
+            let sender = self.end.sender().map_err(GraphError::from)?;
+            let mut receiver = self.end.receiver().map_err(GraphError::from)?;
+            self.signal_receiver.clear();
+            let socket = UdpSocket::bind(self.address).await.map_err(|error| {
+                tracing::error!("Cannot bind address: {error}");
+                GraphError::NodeError
+            })?;
+            self.address = socket.local_addr().map_err(|_| GraphError::Occupied)?;
+            let mut connections: HashMap<SocketAddr, (ConnectionToken, Instant)> = HashMap::new();
+            let mut buffer = [0u8; PACKET_DATA_SIZE];
+            loop {
+                let deadline = connections.values().map(|(_, deadline)| *deadline).min();
+                tokio::select! {
+                    biased;
+                    signal = self.signal_receiver.recv() => match signal {
+                        Some(Signal::SIGTERM) => return Ok(None),
+                        None => {
+                            tracing::error!("Signal receiver is closed");
+                            return Err(GraphError::Disconnected)
+                        },
+                        _ => continue
+                    },
+                    packet = receiver.recv() => match packet {
+                        Some(UpwardPacket::SYN(connection)) => {
+                            sender.send(DownwardPacket::FIN(connection)).await?;
+                            continue;
+                        }
+                        Some(UpwardPacket::FIN(connection)) => {
+                            if let Host::IpAddr(ip_addr) = connection.host() {
+                                connections.remove(&SocketAddr::new(ip_addr, connection.port()));
+                            }
+                        },
+                        Some(UpwardPacket::Data(upward)) => {
+                            match upward.connection().host() {
+                                Host::Domain(_) => sender.send(DownwardPacket::FIN(upward.connection().clone())).await?,
+                                Host::IpAddr(ip_addr) => {
+                                    socket.send_to(&upward.data[..], SocketAddr::new(ip_addr, upward.connection().port())).await.map_err(|error| {
+                                        tracing::error!("UDP socket closed: {error}");
+                                        GraphError::NodeError
+                                    })?;
+                                    if let Some((_, deadline)) = connections.get_mut(&SocketAddr::new(ip_addr, upward.connection().port())) {
+                                        *deadline = Instant::now() + UDP_TIMEOUT;
+                                    }
+                                }
+                            }
+                        },
+                        None => return Ok(Some(Signal::SIGTERM))
+                    },
+                    accepted = socket.recv_from(&mut buffer) => {
+                        let (count, peer) = match accepted {
+                            Ok(result) => result,
+                            Err(error) => {
+                                tracing::error!("UDP receive failed: {error}");
+                                return Ok(Some(Signal::SIGTERM));
+                            }
+                        };
+                        let connection = match connections.get_mut(&peer) {
+                            Some((connection, deadline)) => {
+                                *deadline = Instant::now() + UDP_TIMEOUT;
+                                connection.clone()
+                            }
+                            None => {
+                                let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
+                                sender.send(DownwardPacket::SYN(connection.clone())).await?;
+                                connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
+                                connection
+                            }
+                        };
+                        let data = buffer[..count].to_vec().into_boxed_slice();
+                        if let Ok(downward) = ConnectionDownward::try_new(connection, data) { // Just drop UDP, it's proper "back pressure"
+                            sender.send(DownwardPacket::Data(downward)).await?;
+                        }
+                    },
+                    _ = async move {
+                        match deadline {
+                            Some(deadline) => sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await
+                        }
+                    } => {
+                        let now = Instant::now();
+                        let expired: Vec<SocketAddr> = connections.iter()
+                            .filter(|(_, (_, deadline))| *deadline <= now)
+                            .map(|(peer, _)| *peer)
+                            .collect();
+                        for peer in expired {
+                            if let Some((connection, _)) = connections.remove(&peer) {
+                                sender.send(DownwardPacket::FIN(connection)).await?;
+                            }
+                        }
                     }
                 }
-                UDPNodeMode::Downstream(address_mode) => {
-                    let socket_v4 = match address_mode {
-                        AddressMode::V6 => None,
-                        _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await.map_err(|error| {
-                            tracing::error!("Cannot bind ipv4 address: {error}");
-                            GraphError::NodeError
-                        })?),
-                        
-                    };
-                    let socket_v6 = match address_mode {
-                        AddressMode::V4 => None,
-                        _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).await.map_err(|error| {
-                            tracing::error!("Cannot bind ipv6 address: {error}");
-                            GraphError::NodeError
-                        })?),
-                    };
-                    (socket_v4, socket_v6)
-                }
+            }
+        }
+    }
+
+    /// Downstream UDP node that serves out going UDP connections.
+    /// Has one upstream.
+    #[derive(Debug)]
+    pub struct UDPDownstreamNode {
+        end: NodeUpstreamEndToken,
+        signal_receiver: Receiver<Signal>,
+        mode: AddressMode
+    }
+
+    impl UDPDownstreamNode {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new(mode: AddressMode) -> NodeToken {
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let end = NodeUpstreamEndToken::new();
+            NodeToken::new(
+                Box::new(Self {
+                    end: end.clone(),
+                    signal_receiver,
+                    mode
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![end]),
+                NodeDownstreamInterface::new(vec![])
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Node for UDPDownstreamNode {
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let sender = self.end.sender().map_err(GraphError::from)?;
+            let mut receiver = self.end.receiver().map_err(GraphError::from)?;
+            self.signal_receiver.clear();
+            let socket_v4 = match self.mode {
+                AddressMode::V6 => None,
+                _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).await.map_err(|error| {
+                    tracing::error!("Cannot bind ipv4 address: {error}");
+                    GraphError::NodeError
+                })?),
+                
+            };
+            let socket_v6 = match self.mode {
+                AddressMode::V4 => None,
+                _ => Some(UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).await.map_err(|error| {
+                    tracing::error!("Cannot bind ipv6 address: {error}");
+                    GraphError::NodeError
+                })?),
             };
             let mut connections: HashMap<SocketAddr, (ConnectionToken, Instant)> = HashMap::new();
             let mut buffer_v4 = [0u8; PACKET_DATA_SIZE];
@@ -449,33 +614,20 @@ pub mod common {
                         _ => continue
                     },
                     packet = receiver.recv() => match packet {
-                        Some(Packet::SYN(connection)) => {
-                            if matches!(mode, UDPNodeMode::Upstream(..)) {
-                                if sender.send(Packet::FIN(connection)).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                };
-                                continue;
-                            }
+                        Some(DownwardPacket::SYN(connection)) => {
                             match connection.host() {
-                                Host::Domain(_) => if sender.send(Packet::FIN(connection)).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                },
+                                Host::Domain(_) => sender.send(UpwardPacket::FIN(connection)).await?,
                                 Host::IpAddr(ip_addr) => { connections.insert(SocketAddr::new(ip_addr, connection.port()), (connection, Instant::now() + UDP_TIMEOUT)); }
                             };
                         }
-                        Some(Packet::FIN(connection)) => {
+                        Some(DownwardPacket::FIN(connection)) => {
                             if let Host::IpAddr(ip_addr) = connection.host() {
                                 connections.remove(&SocketAddr::new(ip_addr, connection.port()));
                             }
                         },
-                        Some(Packet::Data(attached)) => {
+                        Some(DownwardPacket::Data(attached)) => {
                             match attached.connection().host() {
-                                Host::Domain(_) => if sender.send(Packet::FIN(attached.connection().clone())).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                },
+                                Host::Domain(_) => sender.send(UpwardPacket::FIN(attached.connection().clone())).await?,
                                 Host::IpAddr(ip_addr) => {
                                     let socket = match ip_addr {
                                         IpAddr::V4(_) => socket_v4.as_ref(),
@@ -508,26 +660,11 @@ pub mod common {
                                 *deadline = Instant::now() + UDP_TIMEOUT;
                                 connection.clone()
                             }
-                            None => {
-                                if matches!(mode, UDPNodeMode::Downstream(..)) {
-                                    tracing::debug!("Received incoming unrecognized packet in downstream mode, ignoring");
-                                    continue;
-                                };
-                                let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
-                                if sender.send(Packet::SYN(connection.clone())).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                };
-                                connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
-                                connection
-                            }
+                            None => continue
                         };
                         let data = buffer_v4[..count].to_vec().into_boxed_slice();
-                        if let Ok(attached) = connection.try_attach(data) { // Just drop UDP, it's proper "back pressure"
-                            sender.send(Packet::Data(attached)).await.map_err(|error| {
-                                tracing::error!("End closed: {error}");
-                                GraphError::Disconnected
-                            })?;
+                        if let Ok(upward) = ConnectionUpward::try_new(connection, data) { // Just drop UDP, it's proper "back pressure"
+                            sender.send(UpwardPacket::Data(upward)).await?;
                         }
                     },
                     accepted_v6 = socket_v6.as_ref().expect("Unwrapping None which is Some").recv_from(&mut buffer_v6), if socket_v6.is_some() => {
@@ -543,26 +680,11 @@ pub mod common {
                                 *deadline = Instant::now() + UDP_TIMEOUT;
                                 connection.clone()
                             }
-                            None => {
-                                if matches!(mode, UDPNodeMode::Downstream(..)) {
-                                    tracing::debug!("Received incoming unrecognized packet in downstream mode, ignoring");
-                                    continue;
-                                };
-                                let connection = ConnectionToken::new(Host::IpAddr(peer.ip()), Transport::UDP, peer.port());
-                                if sender.send(Packet::SYN(connection.clone())).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                };
-                                connections.insert(peer, (connection.clone(), Instant::now() + UDP_TIMEOUT));
-                                connection
-                            }
+                            None => continue
                         };
                         let data = buffer_v6[..count].to_vec().into_boxed_slice();
-                        if let Ok(attached) = connection.try_attach(data) { // Just drop UDP, it's proper "back pressure"
-                            sender.send(Packet::Data(attached)).await.map_err(|error| {
-                                tracing::error!("End closed: {error}");
-                                GraphError::Disconnected
-                            })?;
+                        if let Ok(attached) = ConnectionUpward::try_new(connection, data) { // Just drop UDP, it's proper "back pressure"
+                            sender.send(UpwardPacket::Data(attached)).await?;
                         }
                     },
                     _ = async move {
@@ -577,10 +699,8 @@ pub mod common {
                             .map(|(peer, _)| *peer)
                             .collect();
                         for peer in expired {
-                            if let Some((connection, _)) = connections.remove(&peer)
-                                && sender.send(Packet::FIN(connection)).await.is_err() {
-                                tracing::error!("End closed");
-                                return Err(GraphError::Disconnected);
+                            if let Some((connection, _)) = connections.remove(&peer) {
+                                sender.send(UpwardPacket::FIN(connection)).await?;
                             }
                         }
                     }
@@ -614,12 +734,12 @@ pub mod common {
     #[allow(clippy::mutable_key_type)]
     async fn dns_reject(
         waiters: Vec<ConnectionToken>,
-        blocked: &mut HashMap<ConnectionToken, Vec<Packet>>,
-        upstream_sender: &Sender<Packet>
+        blocked: &mut HashMap<ConnectionToken, Vec<DownwardPacket>>,
+        upstream_sender: &Sender<UpwardPacket>
     ) -> bool {
         for connection in waiters {
             blocked.remove(&connection); // Drops packets
-            let packet = Packet::FIN(connection);
+            let packet = UpwardPacket::FIN(connection);
             if upstream_sender.send(packet).await.is_err() {
                 tracing::error!("End closed");
                 return true;
@@ -632,7 +752,7 @@ pub mod common {
     /// (The user must manage connection state by themselves.)
     enum DNSResolver {
         Socket(UdpSocket),
-        End(Sender<Packet>, OwnedMutexGuard<Receiver<Packet>>, ConnectionToken)
+        End(Sender<DownwardPacket>, OwnedMutexGuard<Receiver<UpwardPacket>>, ConnectionToken)
     }
 
     struct DNSQuery<'a> {
@@ -664,11 +784,11 @@ pub mod common {
                     })?
                 },
                 DNSResolver::End(_, receiver, _) => {
-                    let Packet::Data(attached) = receiver.recv().await.ok_or(Signal::SIGTERM)? else {
+                    let UpwardPacket::Data(upward) = receiver.recv().await.ok_or(Signal::SIGTERM)? else {
                         tracing::error!("Received non-data packet from DNS resolver");
                         return Err(Some(Signal::SIGTERM));
                     };
-                    box_buffer = attached.detach().data;
+                    box_buffer = Into::<ConnectionDetached>::into(upward).data;
                     DNSPacket::parse(&box_buffer).map_err(|_| {
                         tracing::debug!("Received invalid DNS response");
                         None
@@ -720,8 +840,8 @@ pub mod common {
                         })?;
                     }
                     DNSResolver::End(sender, _, connection) => {
-                        let attached = connection.attach(data.into_boxed_slice()).await;
-                        sender.send(Packet::Data(attached)).await.map_err(|_| {
+                        let downward = ConnectionDownward::new(connection.clone(), data.into_boxed_slice()).await;
+                        sender.send(DownwardPacket::Data(downward)).await.map_err(|_| {
                             tracing::debug!("DNS resolver downstream closed");
                             Some(Signal::SIGTERM)
                         })?;
@@ -758,9 +878,9 @@ pub mod common {
     #[pyclass]
     #[derive(Debug)]
     pub struct DNSNode {
-        upstream: NodeEndToken,
-        downstream: NodeEndToken,
-        resolver_downstream: Option<NodeEndToken>,
+        upstream: NodeUpstreamEndToken,
+        downstream: NodeDownstreamEndToken,
+        resolver_downstream: Option<NodeDownstreamEndToken>,
         signal_receiver: Receiver<Signal>,
         resolver: SocketAddr,
         mode: AddressMode,
@@ -776,8 +896,8 @@ pub mod common {
                 return Err("Invalid host");
             };
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            let upstream = NodeEndToken::new();
-            let downstream = NodeEndToken::new();
+            let upstream = NodeUpstreamEndToken::new();
+            let downstream = NodeDownstreamEndToken::new();
             match middleware {
                 true => Ok(NodeToken::new(
                     Box::new(Self {
@@ -797,11 +917,11 @@ pub mod common {
                             .build()
                     }),
                     signal_sender,
-                    NodeInterface::new(vec![upstream]),
-                    NodeInterface::new(vec![downstream])
+                    NodeUpstreamInterface::new(vec![upstream]),
+                    NodeDownstreamInterface::new(vec![downstream])
                 )),
                 false => {
-                    let resolver_downstream = NodeEndToken::new();
+                    let resolver_downstream = NodeDownstreamEndToken::new();
                     Ok(NodeToken::new(
                         Box::new(Self {
                             upstream: upstream.clone(),
@@ -820,8 +940,8 @@ pub mod common {
                                 .build()
                         }),
                         signal_sender,
-                        NodeInterface::new(vec![upstream]),
-                        NodeInterface::new(vec![downstream, resolver_downstream])
+                        NodeUpstreamInterface::new(vec![upstream]),
+                        NodeDownstreamInterface::new(vec![downstream, resolver_downstream])
                     ))
                 }
             }
@@ -867,14 +987,11 @@ pub mod common {
                     let resolver_sender = end.sender().map_err(GraphError::from)?;
                     let resolver_receiver = end.receiver().map_err(GraphError::from)?;
                     let resolver_connection = ConnectionToken::new(Host::IpAddr(self.resolver.ip()), Transport::UDP, self.resolver.port());
-                    if resolver_sender.send(Packet::SYN(resolver_connection.clone())).await.is_err() {
-                        tracing::error!("End closed");
-                        return Err(GraphError::Disconnected);
-                    }
+                    resolver_sender.send(DownwardPacket::SYN(resolver_connection.clone())).await?;
                     DNSResolver::End(resolver_sender, resolver_receiver, resolver_connection)
                 }
             };
-            self.signal_receiver.drain();
+            self.signal_receiver.clear();
             let qtypes: &[TYPE] = match self.mode {
                 AddressMode::V4 => &[TYPE::A],
                 AddressMode::V6 => &[TYPE::AAAA],
@@ -884,7 +1001,7 @@ pub mod common {
             let cname_cache = self.cname_cache.clone();
             let address_cache = self.address_cache.clone();
             #[allow(clippy::mutable_key_type)]
-            let mut blocked: HashMap<ConnectionToken, Vec<Packet>> = HashMap::new();
+            let mut blocked: HashMap<ConnectionToken, Vec<DownwardPacket>> = HashMap::new();
             let mut resolving: HashMap<String, Resolution> = HashMap::new();
             let mut dns_buffer = [0u8; DNS_BUFFER_SIZE];
             let mut dns_nonce = DNSNonce::new();
@@ -904,7 +1021,7 @@ pub mod common {
                     packet = upstream_receiver.recv() => match packet {
                         Some(packet) => {
                             let connection = packet.connection().clone();
-                            if matches!(packet, Packet::SYN(_)) && !connection.is_resolved() {
+                            if packet.is_syn() && !connection.is_resolved() {
                                 if let Some(packets) = blocked.get_mut(&connection) {
                                     packets.push(packet);
                                     continue;
@@ -932,23 +1049,14 @@ pub mod common {
                                 match cached {
                                     Some(Some(ip_addr)) => {
                                         connection.resolve(ip_addr);
-                                        if downstream_sender.send(packet).await.is_err() {
-                                            tracing::error!("End closed");
-                                            return Err(GraphError::Disconnected);
-                                        }
+                                        downstream_sender.send(packet).await?;
                                     }
                                     Some(None) => { // Negative cache hit
-                                        if upstream_sender.send(Packet::FIN(connection.clone())).await.is_err() {
-                                            tracing::error!("End closed");
-                                            return Err(GraphError::Disconnected);
-                                        }
+                                        upstream_sender.send(UpwardPacket::FIN(connection.clone())).await?;
                                     }
                                     None => {
                                         let Some(name) = terminal else { // CNAME exhaustion (Only reachable by cycle)
-                                            if upstream_sender.send(Packet::FIN(connection.clone())).await.is_err() {
-                                                tracing::error!("End closed");
-                                                return Err(GraphError::Disconnected);
-                                            }
+                                            upstream_sender.send(UpwardPacket::FIN(connection.clone())).await?;
                                             continue;
                                         };
                                         if let Some(resolution) = resolving.get_mut(&name) {
@@ -982,9 +1090,8 @@ pub mod common {
                             }
                             if let Some(packets) = blocked.get_mut(&connection) {
                                 packets.push(packet);
-                            } else if downstream_sender.send(packet).await.is_err() {
-                                tracing::error!("End closed");
-                                return Err(GraphError::Disconnected);
+                            } else {
+                                downstream_sender.send(packet).await?;
                             }
                         },
                         None => {
@@ -1015,10 +1122,7 @@ pub mod common {
                                 connection.resolve(ip_addr);
                                 if let Some(packets) = blocked.remove(&connection) {
                                     for packet in packets {
-                                        if downstream_sender.send(packet).await.is_err() {
-                                            tracing::error!("End closed");
-                                            return Err(GraphError::Disconnected);
-                                        }
+                                        downstream_sender.send(packet).await?;
                                     }
                                 }
                             }
@@ -1125,8 +1229,8 @@ pub mod common {
     #[pyclass]
     #[derive(Debug)]
     pub struct PythonNode {
-        pub upstreams: NodeInterface,
-        pub downstreams: NodeInterface,
+        pub upstreams: NodeUpstreamInterface,
+        pub downstreams: NodeDownstreamInterface,
         pub signal_receiver: Receiver<Signal>,
         pub callback: Py<PyAny>
     }
@@ -1140,11 +1244,11 @@ pub mod common {
             }
             let mut u = Vec::with_capacity(upstreams);
             let mut d = Vec::with_capacity(downstreams);
-            u.resize_with(upstreams, NodeEndToken::new);
-            d.resize_with(downstreams, NodeEndToken::new);
+            u.resize_with(upstreams, NodeUpstreamEndToken::new);
+            d.resize_with(downstreams, NodeDownstreamEndToken::new);
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            let u = NodeInterface::new(u);
-            let d = NodeInterface::new(d);
+            let u = NodeUpstreamInterface::new(u);
+            let d = NodeDownstreamInterface::new(d);
             Ok(NodeToken::new(
                 Box::new(Self {
                     upstreams: u.clone(),
@@ -1187,7 +1291,7 @@ pub mod common {
                     for (index, receiver) in upstreams.iter_mut().enumerate() {
                         node_ends.push(Box::pin(async move {
                             match receiver.recv().await {
-                                Some(packet) => (PythonCallbackChannelType::Upstream, index as isize, PythonCallbackChannelObject::DetachedPacket(packet.detach())),
+                                Some(packet) => (PythonCallbackChannelType::Upstream, index as isize, PythonCallbackChannelObject::DetachedPacket(packet.into())),
                                 None => (PythonCallbackChannelType::Upstream, index as isize, PythonCallbackChannelObject::Error(())) // This error is mapped to actual error later in loop
                             }
                         }));
@@ -1195,7 +1299,7 @@ pub mod common {
                     for (index, receiver) in downstreams.iter_mut().enumerate() {
                         node_ends.push(Box::pin(async move {
                             match receiver.recv().await {
-                                Some(packet) => (PythonCallbackChannelType::Downstream, index as isize, PythonCallbackChannelObject::DetachedPacket(packet.detach())),
+                                Some(packet) => (PythonCallbackChannelType::Downstream, index as isize, PythonCallbackChannelObject::DetachedPacket(packet.into())),
                                 None => (PythonCallbackChannelType::Downstream, index as isize, PythonCallbackChannelObject::Error(()))
                             }
                         }));
@@ -1243,6 +1347,605 @@ pub mod common {
                     _ => {
                         tracing::error!("Python callback returned invalid value {:?}", result);
                         return Ok(Some(Signal::SIGTERM));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ClientConfig` or `ServerConfig`
+    #[derive(Clone, Debug)]
+    enum TLSMode {
+        Server(Arc<ServerConfig>),
+        Client(Arc<ClientConfig>)
+    }
+
+    /// TLS server node with one cipher upstream and one plaintext downstream.
+    #[derive(Debug)]
+    pub struct TLSServerNode {
+        cipher: NodeUpstreamEndToken,
+        clear: NodeDownstreamEndToken,
+        signal_receiver: Receiver<Signal>,
+        config: Arc<ServerConfig>
+    }
+
+    impl TLSServerNode {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new(certificates: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<NodeToken, String> {
+            let config = ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certificates, key)
+                .map_err(|error| format!("Invalid certificate or private key: {error}"))?;
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let cipher = NodeUpstreamEndToken::new();
+            let clear = NodeDownstreamEndToken::new();
+            Ok(NodeToken::new(
+                Box::new(Self {
+                    cipher: cipher.clone(),
+                    clear: clear.clone(),
+                    signal_receiver,
+                    config: Arc::new(config)
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![cipher]),
+                NodeDownstreamInterface::new(vec![clear])
+            ))
+        }
+    }
+
+    /// TLS client node, has one upstream (clear) and one downstream (cipher).
+    #[derive(Debug)]
+    pub struct TLSClientNode {
+        clear: NodeUpstreamEndToken,
+        cipher: NodeDownstreamEndToken,
+        signal_receiver: Receiver<Signal>,
+        config: Arc<ClientConfig>
+    }
+
+    impl TLSClientNode {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new() -> NodeToken {
+            let config = ClientConfig::builder()
+                .with_root_certificates(RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() })
+                .with_no_client_auth();
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let clear = NodeUpstreamEndToken::new();
+            let cipher = NodeDownstreamEndToken::new();
+            NodeToken::new(
+                Box::new(Self {
+                    clear: clear.clone(),
+                    cipher: cipher.clone(),
+                    signal_receiver,
+                    config: Arc::new(config)
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![clear]),
+                NodeDownstreamInterface::new(vec![cipher])
+            )
+        }
+    }
+
+    /// The server certificate chain and private key are loaded from PEM files.
+    /// The certificate file may contain the whole chain; the key file may be
+    /// PKCS#1, PKCS#8 or SEC1.
+    #[pyfunction]
+    #[pyo3(name = "TLSNode", signature = (cert_and_key=None))]
+    fn tls_node(cert_and_key: Option<(PathBuf, PathBuf)>) -> PyResult<NodeToken> {
+        let Some((certificate, key)) = cert_and_key else {
+            return Ok(TLSClientNode::new());
+        };
+        let certificate_bytes = std::fs::read(&certificate).map_err(PyFileNotFoundError::new_err)?;
+        let mut certificate_reader = &certificate_bytes[..];
+        let certificate_chain = rustls_pemfile::certs(&mut certificate_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| PyValueError::new_err(format!("Cannot parse certificate: {error}")))?;
+        if certificate_chain.is_empty() {
+            return Err(PyValueError::new_err("No certificate found"));
+        }
+        let key_bytes = std::fs::read(&key).map_err(PyFileNotFoundError::new_err)?;
+        let mut key_reader = &key_bytes[..];
+        let key_der = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|error| PyValueError::new_err(format!("Cannot parse private key: {error}")))?
+            .ok_or(PyValueError::new_err("No private key found"))?;
+        TLSServerNode::new(certificate_chain, key_der).map_err(PyValueError::new_err)
+    }
+
+    #[async_trait]
+    impl Node for TLSServerNode {
+        #[tracing::instrument(name="TLSServerNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let cipher_sender = self.cipher.sender().map_err(GraphError::from)?;
+            let cipher_receiver = self.cipher.receiver().map_err(GraphError::from)?;
+            let clear_sender = self.clear.sender().map_err(GraphError::from)?;
+            let clear_receiver = self.clear.receiver().map_err(GraphError::from)?;
+            tls_run::<Downward>(
+                cipher_sender,
+                cipher_receiver,
+                clear_sender,
+                clear_receiver,
+                &mut self.signal_receiver,
+                TLSMode::Server(self.config.clone())
+            ).await
+        }
+    }
+
+    #[async_trait]
+    impl Node for TLSClientNode {
+        #[tracing::instrument(name="TLSClientNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let clear_sender = self.clear.sender().map_err(GraphError::from)?;
+            let clear_receiver = self.clear.receiver().map_err(GraphError::from)?;
+            let cipher_sender = self.cipher.sender().map_err(GraphError::from)?;
+            let cipher_receiver = self.cipher.receiver().map_err(GraphError::from)?;
+            tls_run::<Upward>(
+                cipher_sender,
+                cipher_receiver,
+                clear_sender,
+                clear_receiver,
+                &mut self.signal_receiver,
+                TLSMode::Client(self.config.clone())
+            ).await
+        }
+    }
+
+    /// Shared runtime for both TLS server and client.
+    ///
+    /// Downward `D` is server (decrypting).
+    #[allow(clippy::mutable_key_type)]
+    #[tracing::instrument(name="tls_run", skip_all)]
+    async fn tls_run<D: Direction>(
+        cipher_sender: Sender<D::BackwardPacket>,
+        mut cipher_receiver: OwnedMutexGuard<Receiver<D::ForwardPacket>>,
+        clear_sender: Sender<D::ForwardPacket>,
+        mut clear_receiver: OwnedMutexGuard<Receiver<D::BackwardPacket>>,
+        signal_receiver: &mut Receiver<Signal>,
+        mode: TLSMode
+    ) -> Result<Option<Signal>, GraphError> {
+        signal_receiver.clear();
+        let trigger_is_cipher = matches!(&mode, TLSMode::Server(_));
+        let mut dispatch: HashMap<ConnectionToken, (Sender<D::ForwardPacket>, Sender<D::BackwardPacket>)> = HashMap::new();
+        let mut handlers: JoinSet<(ConnectionToken, Option<Signal>)> = JoinSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                signal = signal_receiver.recv() => match signal {
+                    Some(Signal::SIGTERM) => return Ok(None),
+                    None => {
+                        tracing::error!("Signal receiver is closed");
+                        return Err(GraphError::Disconnected)
+                    },
+                    _ => continue
+                },
+                handler = handlers.join_next(), if !handlers.is_empty() => match handler {
+                    None => unreachable!("Awaiting non-empty join set that is empty"),
+                    Some(Err(error)) => {
+                        tracing::warn!("TLS handler task failed: {error}");
+                        continue;
+                    }
+                    Some(Ok((connection, signal))) => {
+                        dispatch.remove(&connection);
+                        if let Some(signal) = signal {
+                            tracing::warn!("TLS handler returned signal {:?}, propagating", signal);
+                            return Ok(Some(signal));
+                        }
+                        continue;
+                    }
+                },
+                packet = cipher_receiver.recv() => match packet {
+                    Some(packet) if packet.is_syn() && trigger_is_cipher => {
+                        if !matches!(packet.connection().transport(), Transport::TCP) {
+                            tracing::debug!("TLS is only supported over TCP");
+                            cipher_sender.send(D::BackwardPacket::new_fin(packet.connection().clone())).await?;
+                            continue;
+                        }
+                        let connection = packet.connection().clone();
+                        let (cipher_dispatch, cipher_handler) = channel(CONNECTION_BUFFER_SIZE);
+                        let (clear_dispatch, clear_handler) = channel(CONNECTION_BUFFER_SIZE);
+                        dispatch.insert(connection.clone(), (cipher_dispatch, clear_dispatch));
+                        handlers.spawn(tls_handler::<D>(
+                            connection,
+                            cipher_handler,
+                            clear_handler,
+                            cipher_sender.clone(),
+                            clear_sender.clone(),
+                            mode.clone()
+                        ));
+                    },
+                    Some(packet) if packet.is_syn() => {
+                        tracing::debug!("Received invalid SYN packet");
+                        cipher_sender.send(D::BackwardPacket::new_fin(packet.connection().clone())).await?;
+                    },
+                    Some(packet) => {
+                        match dispatch.get(packet.connection()) {
+                            Some((sender, _)) => { let _ = sender.send(packet).await; },
+                            None if !packet.is_fin() => {
+                                tracing::debug!("Received packet that does not belong");
+                                cipher_sender.send(D::BackwardPacket::new_fin(packet.connection().clone())).await?;
+                            },
+                            None => continue
+                        }
+                    },
+                    None => return Ok(None)
+                },
+                packet = clear_receiver.recv() => match packet {
+                    Some(packet) if packet.is_syn() && !trigger_is_cipher => {
+                        if !matches!(packet.connection().transport(), Transport::TCP) {
+                            tracing::debug!("TLS is only supported over TCP");
+                            clear_sender.send(D::ForwardPacket::new_fin(packet.connection().clone())).await?;
+                            continue;
+                        }
+                        let connection = packet.connection().clone();
+                        let (cipher_dispatch, cipher_handler) = channel(CONNECTION_BUFFER_SIZE);
+                        let (clear_dispatch, clear_handler) = channel(CONNECTION_BUFFER_SIZE);
+                        dispatch.insert(connection.clone(), (cipher_dispatch, clear_dispatch));
+                        handlers.spawn(tls_handler::<D>(
+                            connection,
+                            cipher_handler,
+                            clear_handler,
+                            cipher_sender.clone(),
+                            clear_sender.clone(),
+                            mode.clone()
+                        ));
+                    },
+                    Some(packet) if packet.is_syn() => {
+                        tracing::debug!("Received invalid SYN packet");
+                        clear_sender.send(D::ForwardPacket::new_fin(packet.connection().clone())).await?;
+                    },
+                    Some(packet) => {
+                        match dispatch.get(packet.connection()) {
+                            Some((_, sender)) => { let _ = sender.send(packet).await; },
+                            None if !packet.is_fin() => {
+                                tracing::debug!("Received packet that does not belong");
+                                clear_sender.send(D::ForwardPacket::new_fin(packet.connection().clone())).await?;
+                            },
+                            None => continue
+                        }
+                    },
+                    None => return Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Util: Close the one / two (established) side connections with catch `Signal` failure
+    async fn tls_close<D: Direction>(
+        connection: ConnectionToken,
+        cipher_sender: &Sender<D::BackwardPacket>,
+        clear_sender: &Sender<D::ForwardPacket>,
+        established: bool
+    ) -> Option<Signal> {
+        if cipher_sender.send(D::BackwardPacket::new_fin(connection.clone())).await.is_err() {
+            return Some(Signal::SIGTERM);
+        }
+        if established && clear_sender.send(D::ForwardPacket::new_fin(connection)).await.is_err() {
+            return Some(Signal::SIGTERM);
+        }
+        None
+    }
+
+    /// A rustls connection bundled with some missing buffers, and a simple interface.
+    ///
+    /// Flush on write is necessary due to how rustls works. Follows the usual direction convention.
+    struct TLSStream {
+        connection: TLSConnection,
+        /// Ciphertext in
+        cipher_buffer: Vec<u8>
+    }
+
+    impl TLSStream {
+        fn new(mut connection: TLSConnection) -> Self {
+            // A buffer large enough.
+            //
+            // Because we flush on write, this is only to buffer plaintext
+            // during hanshake.
+            connection.set_buffer_limit(Some(CONNECTION_BUFFER_SIZE * PACKET_DATA_SIZE));
+            Self {
+                connection,
+                cipher_buffer: Vec::new()
+            }
+        }
+
+        fn is_handshaking(&self) -> bool {
+            self.connection.is_handshaking()
+        }
+
+        fn send_close_notify(&mut self) {
+            self.connection.send_close_notify();
+        }
+
+        /// Push to cipher buffer.
+        fn push_cipher(&mut self, data: &[u8]) {
+            self.cipher_buffer.extend_from_slice(data);
+        }
+
+        /// Push to plaintext buffer.
+        /// 
+        /// Fails when buffer is full. However, the buffer is large enough that
+        /// this should not happen if connection buffer rules are followed.
+        fn push_plaintext(&mut self, data: &[u8]) -> Result<(), ()> {
+            self.connection.writer().write_all(data).map_err(|error| {
+                tracing::debug!("TLS write failed: {error}");
+            })
+        }
+
+        /// Flush cipher out (rustls to sender) and cipher in (buffer to rustls).
+        async fn flush_cipher<D: Direction>(
+            &mut self,
+            cipher_sender: &Sender<D::BackwardPacket>,
+            connection: &ConnectionToken
+        ) -> Result<(), Option<Signal>> {
+            let mut tls_buffer = [0u8; PACKET_DATA_SIZE];
+            loop {
+                while self.connection.wants_write() {
+                    let Ok(count) = self.connection.write_tls(&mut &mut tls_buffer[..]) else {
+                        tracing::warn!("TLS write failed");
+                        return Err(None);
+                    };
+                    if count == 0 { // EOF
+                        return Err(None);
+                    }
+                    if cipher_sender.send(D::BackwardPacket::new_data(connection.clone(), tls_buffer[..count].to_vec().into_boxed_slice()).await).await.is_err() {
+                        return Err(Some(Signal::SIGTERM));
+                    }
+                }
+                if self.cipher_buffer.is_empty() || !self.connection.wants_read() {
+                    return Ok(());
+                }
+                let Ok(count) = self.connection.read_tls(&mut self.cipher_buffer.as_slice()) else {
+                    tracing::debug!("TLS read failed");
+                    return Err(None);
+                };
+                if count == 0 { // close_notify
+                    return Err(None);
+                }
+                self.cipher_buffer.drain(..count);
+                if let Err(error) = self.connection.process_new_packets() {
+                    tracing::debug!("TLS processing failed: {error}");
+                    return Err(None);
+                }
+            }
+        }
+
+        /// Flush plaintext out (send).
+        ///
+        /// Plaintext in is directly written into rustls in initial push.
+        async fn flush_plaintext<D: Direction>(
+            &mut self,
+            clear_sender: &Sender<D::ForwardPacket>,
+            connection: &ConnectionToken
+        ) -> Result<(), Option<Signal>> {
+            let mut plain_buffer = [0u8; PACKET_DATA_SIZE];
+            loop {
+                let data = {
+                    let mut reader = self.connection.reader();
+                    match reader.read(&mut plain_buffer) {
+                        Ok(0) => return Ok(()),
+                        Ok(count) => plain_buffer[..count].to_vec().into_boxed_slice(),
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                        Err(_) => {
+                            tracing::debug!("TLS plaintext read failed");
+                            return Err(None);
+                        }
+                    }
+                };
+                if clear_sender.send(D::ForwardPacket::new_data(connection.clone(), data).await).await.is_err() {
+                    return Err(Some(Signal::SIGTERM));
+                }
+            }
+        }
+
+        /// Full flush.
+        async fn flush<D: Direction>(
+            &mut self,
+            cipher_sender: &Sender<D::BackwardPacket>,
+            clear_sender: &Sender<D::ForwardPacket>,
+            connection: &ConnectionToken
+        ) -> Result<(), Option<Signal>> {
+            loop { // rustls needs a clear out buffer so alternating loop is necessary
+                self.flush_cipher::<D>(cipher_sender, connection).await?;
+                self.flush_plaintext::<D>(clear_sender, connection).await?;
+                if self.cipher_buffer.is_empty() || !self.connection.wants_read() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Takes over control until handshake is finished.
+    #[tracing::instrument(name="tls_handshake", skip_all)]
+    async fn tls_handshake<D: Direction>(
+        connection: ConnectionToken,
+        cipher_receiver: &mut Receiver<D::ForwardPacket>,
+        clear_receiver: &mut Receiver<D::BackwardPacket>,
+        cipher_sender: &Sender<D::BackwardPacket>,
+        clear_sender: &Sender<D::ForwardPacket>,
+        mode: TLSMode
+    ) -> Result<TLSStream, Option<Signal>> {
+        let is_client = matches!(&mode, TLSMode::Client(_));
+        let mut established = false;
+        let connection_tls = match &mode {
+            TLSMode::Server(config) => match ServerConnection::new(config.clone()) {
+                Ok(tls) => TLSConnection::Server(tls),
+                Err(error) => {
+                    tracing::debug!("Cannot create TLS connection: {error}");
+                    if cipher_sender.send(D::BackwardPacket::new_fin(connection)).await.is_err() {
+                        return Err(Some(Signal::SIGTERM));
+                    }
+                    return Err(None);
+                }
+            },
+            TLSMode::Client(config) => {
+                let server_name = match connection.host() {
+                    Host::Domain(domain) => ServerName::try_from(domain).ok(),
+                    Host::IpAddr(ip_addr) => Some(ServerName::from(ip_addr))
+                };
+                let Some(server_name) = server_name else {
+                    tracing::debug!("Cannot derive TLS server name");
+                    return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await);
+                };
+                match ClientConnection::new(config.clone(), server_name) {
+                    Ok(tls) => TLSConnection::Client(tls),
+                    Err(error) => {
+                        tracing::debug!("Cannot create TLS connection: {error}");
+                        return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await);
+                    }
+                }
+            }
+        };
+        let mut tls = TLSStream::new(connection_tls);
+        let mut queue: Vec<D::BackwardPacket> = Vec::new(); // emptied carriers for clear data already handed to rustls during the handshake; holding them keeps the connection permits backpressuring the clear side
+        if is_client {
+            if cipher_sender.send(D::BackwardPacket::new_syn(connection.clone())).await.is_err() {
+                return Err(Some(Signal::SIGTERM));
+            }
+            established = true;
+            match tls.flush_cipher::<D>(cipher_sender, &connection).await {
+                Ok(()) => {}
+                Err(Some(signal)) => return Err(Some(signal)),
+                Err(None) => return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await)
+            }
+        }
+        loop {
+            tokio::select! {
+                biased;
+                packet = cipher_receiver.recv() => {
+                    let Some(packet) = packet else {
+                        return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await);
+                    };
+                    let detached: DetachedPacket = packet.into();
+                    match detached {
+                        DetachedPacket::Data(attached) => {
+                            tls.push_cipher(&attached.data);
+                            match tls.flush_cipher::<D>(cipher_sender, &connection).await {
+                                Ok(()) => {}
+                                Err(Some(signal)) => return Err(Some(signal)),
+                                Err(None) => return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await)
+                            }
+                            if !tls.is_handshaking() {
+                                break;
+                            }
+                        },
+                        DetachedPacket::FIN(_) => return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await),
+                        DetachedPacket::SYN(_) => {
+                            tracing::debug!("Received invalid SYN packet");
+                            if cipher_sender.send(D::BackwardPacket::new_fin(connection)).await.is_err() {
+                                return Err(Some(Signal::SIGTERM));
+                            }
+                            return Err(None);
+                        }
+                    }
+                },
+                packet = clear_receiver.recv() => {
+                    let Some(mut packet) = packet else {
+                        return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await);
+                    };
+                    if packet.is_syn() {
+                        if clear_sender.send(D::ForwardPacket::new_fin(connection)).await.is_err() {
+                            return Err(Some(Signal::SIGTERM));
+                        }
+                        return Err(None);
+                    } else if packet.is_fin() {
+                        return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await);
+                    } else {
+                        // Keep emptied packets attached to backpressure
+                        let data = std::mem::replace(packet.data_mut().expect("Clear data packet has data"), Vec::new().into_boxed_slice());
+                        if tls.push_plaintext(&data).is_err() {
+                            return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await);
+                        }
+                        queue.push(packet);
+                    }
+                }
+            }
+        }
+        tracing::debug!("Established TLS connection");
+        if !is_client {
+            if clear_sender.send(D::ForwardPacket::new_syn(connection.clone())).await.is_err() {
+                return Err(Some(Signal::SIGTERM));
+            }
+            established = true;
+        }
+        match tls.flush::<D>(cipher_sender, clear_sender, &connection).await {
+            Ok(()) => {}
+            Err(Some(signal)) => return Err(Some(signal)),
+            Err(None) => return Err(tls_close::<D>(connection, cipher_sender, clear_sender, established).await)
+        }
+        queue.clear();
+        Ok(tls)
+    }
+
+    /// Actual handler of the TLS connection. Handshake + forward loop.
+    #[tracing::instrument(name="tls_handler", skip_all)]
+    async fn tls_handler<D: Direction>(
+        connection: ConnectionToken,
+        mut cipher_receiver: Receiver<D::ForwardPacket>,
+        mut clear_receiver: Receiver<D::BackwardPacket>,
+        cipher_sender: Sender<D::BackwardPacket>,
+        clear_sender: Sender<D::ForwardPacket>,
+        mode: TLSMode
+    ) -> (ConnectionToken, Option<Signal>) {
+        let mut tls = match tls_handshake::<D>(connection.clone(), &mut cipher_receiver, &mut clear_receiver, &cipher_sender, &clear_sender, mode).await {
+            Ok(tls) => tls,
+            Err(signal) => return (connection, signal)
+        };
+        // Established: relay transparently.
+        loop {
+            tokio::select! {
+                biased;
+                packet = cipher_receiver.recv() => {
+                    let Some(packet) = packet else {
+                        return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await);
+                    };
+                    let detached: DetachedPacket = packet.into();
+                    match detached {
+                        DetachedPacket::Data(attached) => {
+                            tls.push_cipher(&attached.data);
+                            match tls.flush::<D>(&cipher_sender, &clear_sender, &connection).await {
+                                Ok(()) => {}
+                                Err(Some(signal)) => return (connection, Some(signal)),
+                                Err(None) => return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await)
+                            }
+                        },
+                        DetachedPacket::FIN(_) => {
+                            tls.send_close_notify();
+                            let _ = tls.flush::<D>(&cipher_sender, &clear_sender, &connection).await;
+                            return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await);
+                        },
+                        DetachedPacket::SYN(_) => {
+                            tracing::debug!("Received invalid SYN packet");
+                            if cipher_sender.send(D::BackwardPacket::new_fin(connection.clone())).await.is_err() {
+                                return (connection, Some(Signal::SIGTERM));
+                            }
+                            return (connection, None);
+                        }
+                    }
+                },
+                packet = clear_receiver.recv() => {
+                    let Some(packet) = packet else {
+                        return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await);
+                    };
+                    let detached: DetachedPacket = packet.into();
+                    match detached {
+                        DetachedPacket::Data(attached) => {
+                            if tls.push_plaintext(&attached.data).is_err() {
+                                return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await);
+                            }
+                            match tls.flush::<D>(&cipher_sender, &clear_sender, &connection).await {
+                                Ok(()) => {}
+                                Err(Some(signal)) => return (connection, Some(signal)),
+                                Err(None) => return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await)
+                            }
+                        },
+                        DetachedPacket::FIN(_) => {
+                            tls.send_close_notify();
+                            let _ = tls.flush::<D>(&cipher_sender, &clear_sender, &connection).await;
+                            return (connection.clone(), tls_close::<D>(connection, &cipher_sender, &clear_sender, true).await);
+                        },
+                        DetachedPacket::SYN(_) => {
+                            if clear_sender.send(D::ForwardPacket::new_fin(connection.clone())).await.is_err() {
+                                return (connection, Some(Signal::SIGTERM));
+                            }
+                            return (connection, None);
+                        }
                     }
                 }
             }

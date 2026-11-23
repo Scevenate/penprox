@@ -1,11 +1,9 @@
-#![allow(clippy::all)]
-
 #[pyo3::pymodule(submodule)]
 pub mod socks5 {
     use crate::_sdk::sdk::*;
     use std::{collections::HashMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}, sync::{Arc, Mutex as MutexStd}};
     use async_trait::async_trait;
-    use pyo3::{exceptions::PyValueError, prelude::*, pyclass, pymethods};
+    use pyo3::{exceptions::PyValueError, prelude::*};
     use tokio::{sync::{OwnedMutexGuard, mpsc::{Receiver, Sender, channel}}, task::JoinSet};
 
     // SOCKS5 byte field semantics
@@ -171,325 +169,239 @@ pub mod socks5 {
         request.into_boxed_slice()
     }
 
-    /// All established connections of the server.
+    /// Dispatch table from a connection to the handler's inbound channel.
     #[derive(Default)]
     #[allow(clippy::mutable_key_type)]
     struct Router {
-        transport: HashMap<ConnectionToken, Sender<Packet>>,
-        session: HashMap<ConnectionToken, Sender<Packet>>
+        upstream: HashMap<ConnectionToken, Sender<DownwardPacket>>,
+        downstream: HashMap<ConnectionToken, Sender<UpwardPacket>>
     }
 
     /// Phone book of all senders ever existed
     /// 
     /// (Born of `clippy::too_many_arguments`)
     struct Relay {
-        upstream_sender: Sender<Packet>,
-        downstream_sender: Sender<Packet>,
+        upstream_sender: Sender<UpwardPacket>,
+        downstream_sender: Sender<DownwardPacket>,
         router: Arc<MutexStd<Router>>
     }
 
-    /// Relays detached packets of `receiver` into `target` through `sender`.
-    async fn forward_handler(
-        receiver: &mut Receiver<Packet>,
+    /// Relays same-direction packets of `receiver` into `target` through `sender`.
+    async fn forward_handler<D: Direction>(
+        receiver: &mut Receiver<D::ForwardPacket>,
         target: &ConnectionToken,
-        sender: &Sender<Packet>,
+        sender: &Sender<D::ForwardPacket>,
         queue: Vec<Box<[u8]>>
     ) -> Result<(), GraphError> {
         for data in queue {
-            sender.send(Packet::Data(target.attach(data).await)).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
+            sender.send(D::ForwardPacket::new_data(target.clone(), data).await).await?;
         }
         loop {
-            match receiver.recv().await {
-                Some(Packet::Data(attached)) => {
-                    let data = attached.detach().data;
-                    sender.send(Packet::Data(target.attach(data).await)).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
+            let Some(packet) = receiver.recv().await else {
+                return Ok(());
+            };
+            let detached: DetachedPacket = packet.into();
+            match detached {
+                DetachedPacket::Data(attached) => {
+                    sender.send(D::ForwardPacket::new_data(target.clone(), attached.data).await).await?;
                 },
-                Some(Packet::FIN(_)) => {
-                    sender.send(Packet::FIN(target.clone())).await.map_err(|error| { tracing::error!("End closed: {error}"); GraphError::Disconnected })?;
+                DetachedPacket::FIN(_) => {
+                    sender.send(D::ForwardPacket::new_fin(target.clone())).await?;
                     return Ok(());
                 },
-                Some(Packet::SYN(_)) | None => return Ok(())
+                DetachedPacket::SYN(_) => return Ok(())
             }
         }
     }
 
-    /// SOCKS5 node. Only supports `CONNECT`; Does not support authentication.
+    /// SOCKS5 server node. Only supports `CONNECT`; Does not support authentication.
     /// 
-    /// When constructed without a server address, the node is a SOCKS5 server:
-    /// - Accepts one upstream SOCKS5 client requests.
-    /// - Sends proxied session to one downstream.
-    /// 
-    /// When constructed with a SOCKS5 server address, the node is a SOCKS5 client:
-    /// - Reads proxied session from one upstream.
-    /// - Initiates SOCKS5 connection with remote server through one downstream.
+    /// - Accepts one upstream SOCKS5 client request.
+    /// - Sends the proxied session to one downstream.
     /// 
     /// The host of an inbound SOCKS5 request is faithfully translated into the
     /// session host without bothering DNS.
-    #[pyclass]
     #[derive(Debug)]
-    pub struct SOCKS5Node {
-        transport: NodeEndToken,
-        session: NodeEndToken,
-        signal_receiver: Receiver<Signal>,
-        server: Option<SocketAddr>
+    pub struct SOCKS5ServerNode {
+        transport: NodeUpstreamEndToken,
+        session: NodeDownstreamEndToken,
+        signal_receiver: Receiver<Signal>
     }
 
-    impl SOCKS5Node {
+    impl SOCKS5ServerNode {
         #[allow(clippy::new_ret_no_self)]
-        pub fn new(server: Option<(Host, u16)>) -> Result<NodeToken, &'static str> {
-            let server = match server.map(|mut server| (server.0.wait_resolve(), server.1)) {
-                Some((Some(ip), port)) => Some(SocketAddr::new(ip, port)),
-                None => None,
-                _ => {
-                    tracing::error!("Server is unreachable");
-                    return Err("Server is unreachable");
-                }
-            };
+        pub fn new() -> NodeToken {
             let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
-            let transport = NodeEndToken::new();
-            let session = NodeEndToken::new();
-            let socks5_node = Self {
-                transport: transport.clone(),
-                session: session.clone(),
-                signal_receiver,
-                server
-            };
-            if server.is_some() {
-                return Ok(NodeToken::new(
-                    Box::new(socks5_node),
-                    signal_sender,
-                    NodeInterface::new(vec![session]),
-                    NodeInterface::new(vec![transport])
-                ))
-            } else {
-                return Ok(NodeToken::new(
-                    Box::new(socks5_node),
-                    signal_sender,
-                    NodeInterface::new(vec![transport]),
-                    NodeInterface::new(vec![session])
-                ))
-            }
+            let transport = NodeUpstreamEndToken::new();
+            let session = NodeDownstreamEndToken::new();
+            NodeToken::new(
+                Box::new(Self {
+                    transport: transport.clone(),
+                    session: session.clone(),
+                    signal_receiver
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![transport]),
+                NodeDownstreamInterface::new(vec![session])
+            )
         }
     }
 
-    #[pymethods]
-    impl SOCKS5Node {
-        #[new]
-        #[pyo3(signature = (server = None))]
+    /// SOCKS5 client node. Only supports `CONNECT`; Does not support authentication.
+    /// 
+    /// - Reads the proxied session from one upstream.
+    /// - Initiates the SOCKS5 connection with the remote server through one downstream.
+    #[derive(Debug)]
+    pub struct SOCKS5ClientNode {
+        session: NodeUpstreamEndToken,
+        transport: NodeDownstreamEndToken,
+        signal_receiver: Receiver<Signal>,
+        server: SocketAddr
+    }
+
+    impl SOCKS5ClientNode {
         #[allow(clippy::new_ret_no_self)]
-        fn python_new(server: Option<(Host, u16)>) -> PyResult<NodeToken> {
-            Self::new(server).map_err(PyValueError::new_err)
+        pub fn new(mut server: Host, port: u16) -> Result<NodeToken, &'static str> {
+            let Some(ip) = server.wait_resolve() else {
+                tracing::error!("Server is unreachable");
+                return Err("Server is unreachable");
+            };
+            let (signal_sender, signal_receiver) = channel(SIGNAL_BUFFER_SIZE);
+            let session = NodeUpstreamEndToken::new();
+            let transport = NodeDownstreamEndToken::new();
+            Ok(NodeToken::new(
+                Box::new(Self {
+                    session: session.clone(),
+                    transport: transport.clone(),
+                    signal_receiver,
+                    server: SocketAddr::new(ip, port)
+                }),
+                signal_sender,
+                NodeUpstreamInterface::new(vec![session]),
+                NodeDownstreamInterface::new(vec![transport])
+            ))
+        }
+    }
+
+    #[pyfunction]
+    #[pyo3(name = "SOCKS5Node", signature = (server=None))]
+    fn socks5_node(server: Option<(Host, u16)>) -> PyResult<NodeToken> {
+        match server {
+            None => Ok(SOCKS5ServerNode::new()),
+            Some((host, port)) => SOCKS5ClientNode::new(host, port).map_err(PyValueError::new_err)
         }
     }
 
     #[async_trait]
-    impl Node for SOCKS5Node {
-        #[tracing::instrument(name="SOCKS5Node::run", skip_all)]
+    impl Node for SOCKS5ServerNode {
+        #[tracing::instrument(name="SOCKS5ServerNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
-            self.signal_receiver.drain();
-            match self.server {
-                None => {
-                    let upstream_sender = self.transport.sender().map_err(GraphError::from)?;
-                    let upstream_receiver = self.transport.receiver().map_err(GraphError::from)?;
-                    let downstream_sender = self.session.sender().map_err(GraphError::from)?;
-                    let downstream_receiver = self.session.receiver().map_err(GraphError::from)?;
-                    self.run_server(upstream_sender, upstream_receiver, downstream_sender, downstream_receiver).await
-                },
-                Some(server) => {
-                    let upstream_sender = self.session.sender().map_err(GraphError::from)?;
-                    let upstream_receiver = self.session.receiver().map_err(GraphError::from)?;
-                    let downstream_sender = self.transport.sender().map_err(GraphError::from)?;
-                    let downstream_receiver = self.transport.receiver().map_err(GraphError::from)?;
-                    self.run_client(upstream_sender, upstream_receiver, downstream_sender, downstream_receiver, server).await
-                }
-            }
+            let upstream_sender = self.transport.sender().map_err(GraphError::from)?;
+            let upstream_receiver = self.transport.receiver().map_err(GraphError::from)?;
+            let downstream_sender = self.session.sender().map_err(GraphError::from)?;
+            let downstream_receiver = self.session.receiver().map_err(GraphError::from)?;
+            socks5_run(upstream_sender, upstream_receiver, downstream_sender, downstream_receiver, &mut self.signal_receiver, None).await
         }
     }
 
-    impl SOCKS5Node {
-        #[allow(clippy::mutable_key_type)]
-        #[tracing::instrument(name="SOCKS5Node::run_server", skip_all)]
-        async fn run_server(
-            &mut self,
-            upstream_sender: Sender<Packet>, // SOCKS5 raw
-            mut upstream_receiver: OwnedMutexGuard<Receiver<Packet>>,
-            downstream_sender: Sender<Packet>, // Proxied data
-            mut downstream_receiver: OwnedMutexGuard<Receiver<Packet>>
-        ) -> Result<Option<Signal>, GraphError> {
-            let router: Arc<MutexStd<Router>> = Arc::new(MutexStd::new(Router::default()));
-            let mut handlers: JoinSet<Option<Signal>> = JoinSet::new(); // This cancels on drop
-            loop {
-                tokio::select! {
-                    biased;
-                    signal = self.signal_receiver.recv() => match signal {
-                        Some(Signal::SIGTERM) => return Ok(None),
-                        None => {
-                            tracing::error!("Signal receiver is closed");
-                            return Err(GraphError::Disconnected)
-                        },
-                        Some(signal) => {
-                            tracing::warn!("Received unknown signal {:?}", signal);
-                            continue
-                        }
-                    },
-                    handler = handlers.join_next(), if !handlers.is_empty() => match handler {
-                        None => unreachable!("Awaiting non-empty join set that is empty"),
-                        Some(Err(error)) => {
-                            tracing::warn!("SOCKS5 handler task failed: {error}");
-                            continue;
-                        }
-                        Some(Ok(signal)) => {
-                            if let Some(signal) = signal {
-                                tracing::warn!("SOCKS5 handler returned signal {:?}, propagating", signal);
-                                return Ok(Some(signal));
-                            }
-                            continue;
-                        }
-                    },
-                    packet = upstream_receiver.recv() => match packet {
-                        Some(Packet::SYN(transport)) => {
-                            let (transport_sender, transport_receiver) = channel(CONNECTION_BUFFER_SIZE);
-                            let (session_sender, session_receiver) = channel(CONNECTION_BUFFER_SIZE);
-                            router.lock().expect("Router is poisoned").transport.insert(transport.clone(), transport_sender);
-                            handlers.spawn(server_handler(
-                                transport,
-                                transport_receiver,
-                                session_receiver,
-                                session_sender,
-                                Relay {
-                                    upstream_sender: upstream_sender.clone(),
-                                    downstream_sender: downstream_sender.clone(),
-                                    router: router.clone()
-                                }
-                            ));
-                        },
-                        Some(packet) => {
-                            let sender = router.lock().expect("Router is poisoned").transport.get(packet.connection()).cloned();
-                            match sender {
-                                Some(sender) => { let _ = sender.send(packet).await; }, // Guaranteed to success, given that packets after FIN does not matter
-                                None if !packet.is_fin() => {
-                                    tracing::debug!("Received packet that does not belong");
-                                    if upstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
-                                        tracing::error!("End closed");
-                                        return Err(GraphError::Disconnected);
-                                    }
-                                },
-                                None => continue
-                            }
-                        },
-                        None => return Ok(None)
-                    },
-                    packet = downstream_receiver.recv() => match packet {
-                        Some(Packet::SYN(session)) => {
-                            if downstream_sender.send(Packet::FIN(session)).await.is_err() {
-                                tracing::error!("End closed");
-                                return Err(GraphError::Disconnected);
-                            }
-                        },
-                        Some(packet) => {
-                            let sender = router.lock().expect("Router is poisoned").session.get(packet.connection()).cloned();
-                            match sender {
-                                Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if downstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                },
-                                None => continue
-                            }
-                        },
-                        None => return Ok(None)
-                    }
-                }
-            }
+    #[async_trait]
+    impl Node for SOCKS5ClientNode {
+        #[tracing::instrument(name="SOCKS5ClientNode::run", skip_all)]
+        async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
+            let upstream_sender = self.session.sender().map_err(GraphError::from)?;
+            let upstream_receiver = self.session.receiver().map_err(GraphError::from)?;
+            let downstream_sender = self.transport.sender().map_err(GraphError::from)?;
+            let downstream_receiver = self.transport.receiver().map_err(GraphError::from)?;
+            socks5_run(upstream_sender, upstream_receiver, downstream_sender, downstream_receiver, &mut self.signal_receiver, Some(self.server)).await
         }
+    }
 
-        #[allow(clippy::mutable_key_type)]
-        #[tracing::instrument(name="SOCKS5Node::run_client", skip_all)]
-        async fn run_client(
-            &mut self,
-            upstream_sender: Sender<Packet>, // Proxied data
-            mut upstream_receiver: OwnedMutexGuard<Receiver<Packet>>,
-            downstream_sender: Sender<Packet>, // SOCKS5 raw
-            mut downstream_receiver: OwnedMutexGuard<Receiver<Packet>>,
-            server: SocketAddr
-        ) -> Result<Option<Signal>, GraphError> {
-            let router: Arc<MutexStd<Router>> = Arc::new(MutexStd::new(Router::default()));
-            let mut handlers: JoinSet<Option<Signal>> = JoinSet::new();
-            loop {
-                tokio::select! {
-                    biased;
-                    signal = self.signal_receiver.recv() => match signal {
-                        Some(Signal::SIGTERM) => return Ok(None),
-                        None => {
-                            tracing::error!("Signal receiver is closed");
-                            return Err(GraphError::Disconnected)
-                        },
-                        _ => continue
+    /// Shared runtime for both SOCKS5 server and client.
+    /// 
+    /// `server` is `None` for the server node and `Some(address)` for the client node.
+    #[allow(clippy::mutable_key_type)]
+    #[tracing::instrument(name="socks5_run", skip_all)]
+    async fn socks5_run(
+        upstream_sender: Sender<UpwardPacket>,
+        mut upstream_receiver: OwnedMutexGuard<Receiver<DownwardPacket>>,
+        downstream_sender: Sender<DownwardPacket>,
+        mut downstream_receiver: OwnedMutexGuard<Receiver<UpwardPacket>>,
+        signal_receiver: &mut Receiver<Signal>,
+        server: Option<SocketAddr>
+    ) -> Result<Option<Signal>, GraphError> {
+        signal_receiver.clear();
+        let router: Arc<MutexStd<Router>> = Arc::new(MutexStd::new(Router::default()));
+        let mut handlers: JoinSet<Option<Signal>> = JoinSet::new(); // This cancels on drop
+        loop {
+            tokio::select! {
+                biased;
+                signal = signal_receiver.recv() => match signal {
+                    Some(Signal::SIGTERM) => return Ok(None),
+                    None => {
+                        tracing::error!("Signal receiver is closed");
+                        return Err(GraphError::Disconnected)
                     },
-                    handler = handlers.join_next(), if !handlers.is_empty() => match handler {
-                        None => unreachable!("Awaiting non-empty join set that is empty"),
-                        Some(Err(error)) => {
-                            tracing::warn!("SOCKS5 handler task failed: {error}");
-                            continue;
-                        }
-                        Some(Ok(signal)) => {
-                            if let Some(signal) = signal {
-                                return Ok(Some(signal));
-                            }
-                            continue;
-                        }
-                    },
-                    packet = upstream_receiver.recv() => match packet {
-                        Some(Packet::SYN(session)) => {
-                            let (session_sender, session_receiver) = channel(CONNECTION_BUFFER_SIZE);
-                            let (transport_sender, transport_receiver) = channel(CONNECTION_BUFFER_SIZE);
-                            router.lock().expect("Router is poisoned").session.insert(session.clone(), session_sender);
-                            handlers.spawn(client_handler(
-                                session,
-                                session_receiver,
-                                transport_receiver,
-                                transport_sender,
-                                server,
-                                Relay {
-                                    upstream_sender: upstream_sender.clone(),
-                                    downstream_sender: downstream_sender.clone(),
-                                    router: router.clone()
-                                }
-                            ));
-                        },
-                        Some(packet) => {
-                            let sender = router.lock().expect("Router is poisoned").session.get(packet.connection()).cloned();
-                            match sender {
-                                Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if upstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                },
-                                None => continue
-                            }
-                        },
-                        None => return Ok(None)
-                    },
-                    packet = downstream_receiver.recv() => match packet {
-                        Some(Packet::SYN(transport)) => {
-                            if downstream_sender.send(Packet::FIN(transport)).await.is_err() {
-                                tracing::error!("End closed");
-                                return Err(GraphError::Disconnected);
-                            }
-                        },
-                        Some(packet) => {
-                            let sender = router.lock().expect("Router is poisoned").transport.get(packet.connection()).cloned();
-                            match sender {
-                                Some(sender) => { let _ = sender.send(packet).await; },
-                                None if !packet.is_fin() => if downstream_sender.send(Packet::FIN(packet.connection().clone())).await.is_err() {
-                                    tracing::error!("End closed");
-                                    return Err(GraphError::Disconnected);
-                                },
-                                None => continue
-                            }
-                        },
-                        None => return Ok(None)
+                    Some(signal) => {
+                        tracing::warn!("Received unknown signal {:?}", signal);
+                        continue
                     }
+                },
+                handler = handlers.join_next(), if !handlers.is_empty() => match handler {
+                    None => unreachable!("Awaiting non-empty join set that is empty"),
+                    Some(Err(error)) => {
+                        tracing::warn!("SOCKS5 handler task failed: {error}");
+                        continue;
+                    }
+                    Some(Ok(signal)) => {
+                        if let Some(signal) = signal {
+                            tracing::warn!("SOCKS5 handler returned signal {:?}, propagating", signal);
+                            return Ok(Some(signal));
+                        }
+                        continue;
+                    }
+                },
+                packet = upstream_receiver.recv() => match packet {
+                    Some(packet) if packet.is_syn() => {
+                        let connection = packet.connection().clone();
+                        let (upstream_dispatch, upstream_handler) = channel(CONNECTION_BUFFER_SIZE);
+                        let (downstream_dispatch, downstream_handler) = channel(CONNECTION_BUFFER_SIZE);
+                        router.lock().expect("Router is poisoned").upstream.insert(connection.clone(), upstream_dispatch);
+                        let relay = Relay {
+                            upstream_sender: upstream_sender.clone(),
+                            downstream_sender: downstream_sender.clone(),
+                            router: router.clone()
+                        };
+                        match server {
+                            None => handlers.spawn(server_handler(connection, upstream_handler, downstream_handler, downstream_dispatch, relay)),
+                            Some(server) => handlers.spawn(client_handler(connection, upstream_handler, downstream_handler, downstream_dispatch, server, relay))
+                        };
+                    },
+                    Some(packet) => {
+                        let sender = router.lock().expect("Router is poisoned").upstream.get(packet.connection()).cloned();
+                        match sender {
+                            Some(sender) => { let _ = sender.send(packet).await; }, // Guaranteed to success, given that packets after FIN does not matter
+                            None if !packet.is_fin() => {
+                                tracing::debug!("Received packet that does not belong");
+                                upstream_sender.send(UpwardPacket::FIN(packet.connection().clone())).await?;
+                            },
+                            None => continue
+                        }
+                    },
+                    None => return Ok(None)
+                },
+                packet = downstream_receiver.recv() => match packet {
+                    Some(packet) if packet.is_syn() => {
+                        downstream_sender.send(DownwardPacket::FIN(packet.connection().clone())).await?;
+                    },
+                    Some(packet) => {
+                        let sender = router.lock().expect("Router is poisoned").downstream.get(packet.connection()).cloned();
+                        match sender {
+                            Some(sender) => { let _ = sender.send(packet).await; },
+                            None if !packet.is_fin() => downstream_sender.send(DownwardPacket::FIN(packet.connection().clone())).await?,
+                            None => continue
+                        }
+                    },
+                    None => return Ok(None)
                 }
             }
         }
@@ -498,9 +410,9 @@ pub mod socks5 {
     /// SOCKS5 server handler wrapper
     async fn server_handler(
         transport: ConnectionToken,
-        transport_receiver: Receiver<Packet>,
-        session_receiver: Receiver<Packet>,
-        session_sender: Sender<Packet>,
+        transport_receiver: Receiver<DownwardPacket>,
+        session_receiver: Receiver<UpwardPacket>,
+        session_sender: Sender<UpwardPacket>,
         relay: Relay
     ) -> Option<Signal> {
         let mut session = None;
@@ -513,9 +425,9 @@ pub mod socks5 {
             &relay
         ).await;
         let mut guard = relay.router.lock().expect("Router is poisoned");
-        guard.transport.remove(&transport);
+        guard.upstream.remove(&transport);
         if let Some(session) = &session {
-            guard.session.remove(session);
+            guard.downstream.remove(session);
         }
         signal
     }
@@ -524,26 +436,29 @@ pub mod socks5 {
     async fn server_session(
         transport: ConnectionToken,
         session_out: &mut Option<ConnectionToken>,
-        mut transport_receiver: Receiver<Packet>,
-        mut session_receiver: Receiver<Packet>,
-        session_sender: Sender<Packet>,
+        mut transport_receiver: Receiver<DownwardPacket>,
+        mut session_receiver: Receiver<UpwardPacket>,
+        session_sender: Sender<UpwardPacket>,
         relay: &Relay
     ) -> Option<Signal> {
         tracing::debug!("Accepted new connection from client");
         let mut buffer = Vec::new();
         let mut established = false;
         let session = loop {
-            let Some(Packet::Data(attached)) = transport_receiver.recv().await else {
+            let Some(packet) = transport_receiver.recv().await else {
+                return None;
+            };
+            let detached: DetachedPacket = packet.into();
+            let DetachedPacket::Data(attached) = detached else {
                 return None;
             };
             buffer.extend_from_slice(&attached.data);
-            drop(attached);
             if !established {
                 match parse_client_hello(&buffer) {
                     Socks5ClientHello::Incomplete => continue,
                     Socks5ClientHello::Invalid => {
                         tracing::debug!("Invalid SOCKS5 client hello");
-                        if relay.upstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
+                        if relay.upstream_sender.send(UpwardPacket::new_fin(transport.clone())).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
                         return None;
@@ -552,7 +467,7 @@ pub mod socks5 {
                         buffer.clear();
                         established = true;
                         let reply = Box::from([SOCKS5_VERSION, SOCKS5_METHOD_NO_AUTH]);
-                        if relay.upstream_sender.send(Packet::Data(transport.attach(reply).await)).await.is_err() {
+                        if relay.upstream_sender.send(UpwardPacket::new_data(transport.clone(), reply).await).await.is_err() {
                             return Some(Signal::SIGTERM);
                         }
                         continue;
@@ -563,7 +478,7 @@ pub mod socks5 {
                 Socks5Request::Incomplete => continue,
                 Socks5Request::Invalid => {
                     tracing::debug!("Invalid SOCKS5 request");
-                    if relay.upstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
+                    if relay.upstream_sender.send(UpwardPacket::new_fin(transport)).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     return None;
@@ -571,23 +486,23 @@ pub mod socks5 {
                 Socks5Request::Unsupported => {
                     tracing::debug!("Unsupported SOCKS5 request");
                     let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_COMMAND_UNSUPPORTED, 0x00, SOCKS5_ADDRESS_IPV4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-                    if relay.upstream_sender.send(Packet::Data(transport.attach(reply).await)).await.is_err() {
+                    if relay.upstream_sender.send(UpwardPacket::new_data(transport.clone(), reply).await).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
-                    if relay.upstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
+                    if relay.upstream_sender.send(UpwardPacket::new_fin(transport)).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     return None;
                 },
                 Socks5Request::Connect(host, port) => {
                     let session = ConnectionToken::new(host, Transport::TCP, port);
-                    relay.router.lock().expect("Router is poisoned").session.insert(session.clone(), session_sender);
+                    relay.router.lock().expect("Router is poisoned").downstream.insert(session.clone(), session_sender);
                     *session_out = Some(session.clone());
-                    if relay.downstream_sender.send(Packet::SYN(session.clone())).await.is_err() {
+                    if relay.downstream_sender.send(DownwardPacket::new_syn(session.clone())).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     let reply = Box::from([SOCKS5_VERSION, SOCKS5_REPLY_SUCCEEDED, 0x00, SOCKS5_ADDRESS_IPV4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-                    if relay.upstream_sender.send(Packet::Data(transport.attach(reply).await)).await.is_err() {
+                    if relay.upstream_sender.send(UpwardPacket::new_data(transport.clone(), reply).await).await.is_err() {
                         return Some(Signal::SIGTERM);
                     }
                     break session;
@@ -596,15 +511,15 @@ pub mod socks5 {
         };
         tracing::debug!("Established SOCKS5 connection");
         match tokio::select! {
-            result = forward_handler(&mut transport_receiver, &session, &relay.downstream_sender, Vec::new()) => result,
-            result = forward_handler(&mut session_receiver, &transport, &relay.upstream_sender, Vec::new()) => result
+            result = forward_handler::<Downward>(&mut transport_receiver, &session, &relay.downstream_sender, Vec::new()) => result,
+            result = forward_handler::<Upward>(&mut session_receiver, &transport, &relay.upstream_sender, Vec::new()) => result
         } {
             Ok(()) => {
                 tracing::debug!("SOCKS5 connection closed");
                 None
             },
             Err(error) => {
-                tracing::error!("SOCKS5 session forwarding failed: {error}");
+                tracing::error!("SOCKS5 session downwarding failed: {error}");
                 Some(Signal::SIGTERM)
             }
         }
@@ -613,9 +528,9 @@ pub mod socks5 {
     /// SOCKS5 client handler wrapper
     async fn client_handler(
         session: ConnectionToken,
-        session_receiver: Receiver<Packet>,
-        transport_receiver: Receiver<Packet>,
-        transport_sender: Sender<Packet>,
+        session_receiver: Receiver<DownwardPacket>,
+        transport_receiver: Receiver<UpwardPacket>,
+        transport_sender: Sender<UpwardPacket>,
         server: SocketAddr,
         relay: Relay
     ) -> Option<Signal> {
@@ -630,9 +545,9 @@ pub mod socks5 {
             &relay
         ).await;
         let mut guard = relay.router.lock().expect("Router is poisoned");
-        guard.session.remove(&session);
+        guard.upstream.remove(&session);
         if let Some(transport) = &transport_out {
-            guard.transport.remove(transport);
+            guard.downstream.remove(transport);
         }
         signal
     }
@@ -641,21 +556,21 @@ pub mod socks5 {
     async fn client_session(
         session: ConnectionToken,
         transport_out: &mut Option<ConnectionToken>,
-        mut session_receiver: Receiver<Packet>,
-        mut transport_receiver: Receiver<Packet>,
-        transport_sender: Sender<Packet>,
+        mut session_receiver: Receiver<DownwardPacket>,
+        mut transport_receiver: Receiver<UpwardPacket>,
+        transport_sender: Sender<UpwardPacket>,
         server: SocketAddr,
         relay: &Relay
     ) -> Option<Signal> {
         tracing::debug!("SOCKS5 client connection reached server");
         let transport = ConnectionToken::new(Host::IpAddr(server.ip()), Transport::TCP, server.port());
-        relay.router.lock().expect("Router is poisoned").transport.insert(transport.clone(), transport_sender);
+        relay.router.lock().expect("Router is poisoned").downstream.insert(transport.clone(), transport_sender);
         *transport_out = Some(transport.clone());
-        if relay.downstream_sender.send(Packet::SYN(transport.clone())).await.is_err() {
+        if relay.downstream_sender.send(DownwardPacket::new_syn(transport.clone())).await.is_err() {
             return Some(Signal::SIGTERM);
         }
         let greeting = Box::from([SOCKS5_VERSION, 0x01, SOCKS5_METHOD_NO_AUTH]);
-        if relay.downstream_sender.send(Packet::Data(transport.attach(greeting).await)).await.is_err() {
+        if relay.downstream_sender.send(DownwardPacket::new_data(transport.clone(), greeting).await).await.is_err() {
             return Some(Signal::SIGTERM);
         }
         let mut buffer = Vec::new();
@@ -665,63 +580,78 @@ pub mod socks5 {
             tokio::select! {
                 biased;
                 packet = transport_receiver.recv() => match packet {
-                    Some(Packet::Data(attached)) => {
-                        buffer.extend_from_slice(&attached.data);
-                        drop(attached);
-                        if !established {
-                            match parse_server_hello(&buffer) {
-                                Socks5ServerHello::Incomplete => continue,
-                                Socks5ServerHello::Invalid => {
-                                    tracing::debug!("Invalid SOCKS5 server hello");
-                                    if relay.upstream_sender.send(Packet::FIN(session.clone())).await.is_err() {
-                                        return Some(Signal::SIGTERM);
+                    Some(packet) => {
+                        let detached: DetachedPacket = packet.into();
+                        match detached {
+                            DetachedPacket::Data(attached) => {
+                                buffer.extend_from_slice(&attached.data);
+                                if !established {
+                                    match parse_server_hello(&buffer) {
+                                        Socks5ServerHello::Incomplete => continue,
+                                        Socks5ServerHello::Invalid => {
+                                            tracing::debug!("Invalid SOCKS5 server hello");
+                                            if relay.upstream_sender.send(UpwardPacket::new_fin(session)).await.is_err() {
+                                                return Some(Signal::SIGTERM);
+                                            }
+                                            if relay.downstream_sender.send(DownwardPacket::new_fin(transport.clone())).await.is_err() {
+                                                return Some(Signal::SIGTERM);
+                                            }
+                                            return None;
+                                        },
+                                        Socks5ServerHello::Ok => {
+                                            buffer.clear();
+                                            established = true;
+                                            let request = build_request(session.host(), session.port());
+                                            if relay.downstream_sender.send(DownwardPacket::new_data(transport.clone(), request).await).await.is_err() {
+                                                return Some(Signal::SIGTERM);
+                                            }
+                                            continue;
+                                        }
                                     }
-                                    if relay.downstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
-                                        return Some(Signal::SIGTERM);
-                                    }
-                                    return None;
-                                },
-                                Socks5ServerHello::Ok => {
-                                    buffer.clear();
-                                    established = true;
-                                    let request = build_request(session.host(), session.port());
-                                    if relay.downstream_sender.send(Packet::Data(transport.attach(request).await)).await.is_err() {
-                                        return Some(Signal::SIGTERM);
-                                    }
-                                    continue;
                                 }
-                            }
-                        }
-                        match parse_reply(&buffer) {
-                            Socks5Reply::Incomplete => continue,
-                            Socks5Reply::Invalid => {
-                                tracing::debug!("Invalid SOCKS5 reply");
-                                if relay.upstream_sender.send(Packet::FIN(session.clone())).await.is_err() {
-                                    return Some(Signal::SIGTERM);
+                                match parse_reply(&buffer) {
+                                    Socks5Reply::Incomplete => continue,
+                                    Socks5Reply::Invalid => {
+                                        tracing::debug!("Invalid SOCKS5 reply");
+                                        if relay.upstream_sender.send(UpwardPacket::new_fin(session)).await.is_err() {
+                                            return Some(Signal::SIGTERM);
+                                        }
+                                        if relay.downstream_sender.send(DownwardPacket::new_fin(transport)).await.is_err() {
+                                            return Some(Signal::SIGTERM);
+                                        }
+                                        return None;
+                                    },
+                                    Socks5Reply::Ok => break
                                 }
-                                if relay.downstream_sender.send(Packet::FIN(transport.clone())).await.is_err() {
-                                    return Some(Signal::SIGTERM);
-                                }
+                            },
+                            DetachedPacket::FIN(_) => {
+                                let _ = relay.upstream_sender.send(UpwardPacket::new_fin(session)).await;
                                 return None;
                             },
-                            Socks5Reply::Ok => break
+                            DetachedPacket::SYN(_) => {
+                                let _ = relay.downstream_sender.send(DownwardPacket::new_fin(transport)).await;
+                                return None;
+                            }
                         }
                     },
-                    Some(Packet::FIN(_)) | None => {
-                        let _ = relay.upstream_sender.send(Packet::FIN(session.clone())).await;
-                        return None;
-                    },
-                    Some(Packet::SYN(_)) => {
-                        let _ = relay.downstream_sender.send(Packet::FIN(transport.clone())).await;
+                    None => {
+                        let _ = relay.upstream_sender.send(UpwardPacket::new_fin(session)).await;
                         return None;
                     }
                 },
                 packet = session_receiver.recv() => match packet {
-                    Some(Packet::Data(attached)) => {
-                        queue.push(attached.detach().data);
+                    Some(packet) => {
+                        let detached: DetachedPacket = packet.into();
+                        match detached {
+                            DetachedPacket::Data(attached) => queue.push(attached.data),
+                            _ => {
+                                let _ = relay.downstream_sender.send(DownwardPacket::new_fin(transport)).await;
+                                return None;
+                            }
+                        }
                     },
-                    Some(Packet::FIN(_)) | None | Some(Packet::SYN(_)) => {
-                        let _ = relay.downstream_sender.send(Packet::FIN(transport.clone())).await;
+                    None => {
+                        let _ = relay.downstream_sender.send(DownwardPacket::new_fin(transport)).await;
                         return None;
                     }
                 }
@@ -729,15 +659,15 @@ pub mod socks5 {
         }
         tracing::debug!("Established SOCKS5 connection with server");
         match tokio::select! {
-            result = forward_handler(&mut transport_receiver, &session, &relay.upstream_sender, Vec::new()) => result,
-            result = forward_handler(&mut session_receiver, &transport, &relay.downstream_sender, queue) => result
+            result = forward_handler::<Upward>(&mut transport_receiver, &session, &relay.upstream_sender, Vec::new()) => result,
+            result = forward_handler::<Downward>(&mut session_receiver, &transport, &relay.downstream_sender, queue) => result
         } {
             Ok(()) => {
                 tracing::debug!("SOCKS5 connection with server closed");
                 None
             },
             Err(error) => {
-                tracing::error!("SOCKS5 session forwarding failed: {error}");
+                tracing::error!("SOCKS5 session downwarding failed: {error}");
                 Some(Signal::SIGTERM)
             }
         }

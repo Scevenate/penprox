@@ -36,7 +36,7 @@ def callback(e: PythonNodeCallbackArg) -> bool | Signal:
     return False
 
 python_node = PythonNode(callback, 1, 1)
-ends: list[NodeEnd] = [python_node.upstreams[0], python_node.downstreams[0]]
+ends: tuple[NodeUpstreamEnd, NodeDownstreamEnd] = (python_node.upstreams[0], python_node.downstreams[0])
 
 graph = (
     TCPNode((IPv4Address("127.0.0.1"), 1080))

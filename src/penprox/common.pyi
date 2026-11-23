@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from ipaddress import IPv4Address, IPv6Address
+from os import PathLike
 from typing import Literal
 
 from .sdk import *
@@ -80,4 +81,18 @@ def PythonNode(
 
     Note that the node must be properly connected as usual, and `SIGTERM` 
     quits directly than invoking the callback.
+    """
+
+def TLSNode(
+        cert_and_key: tuple[str | PathLike[str], str | PathLike[str]] | None = None
+    ) -> Node:
+    """
+    TLS node, could act as client middleware or server middleware.
+
+    When `cert_and_key` is provided, the node unwraps server connections.
+    Certificate may contain the whole chain; PKCS#1, PKCS#8 and SEC1 keys
+    are supported.
+
+    When not provided, the node wraps client connections. `DNSNode` should be
+    put after this node as it resolves the domain.
     """

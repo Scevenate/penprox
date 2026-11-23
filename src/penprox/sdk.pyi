@@ -20,7 +20,7 @@ class LogLevel(Enum):
 
 def set_logger(
         dest: TextIO | str | PathLike[str],
-        level: LogLevel = LogLevel.WARN
+        level: LogLevel = LogLevel.INFO
     ) -> None:
     """
     Install the global logger.
@@ -34,12 +34,12 @@ class Connection:
     A conceptual, immutable connection.
     """
     host: str | IPv4Address | IPv6Address
-    tranport: Literal["TCP", "UDP"]
+    transport: Literal["TCP", "UDP"]
     port: int
     def __init__(
         self,
         host: str | IPv4Address | IPv6Address,
-        transport: Literal["TCP, UDP"],
+        transport: Literal["TCP", "UDP"],
         port: int
     ):
         """
@@ -65,9 +65,9 @@ class Packet:
 
 type Signal = Literal["SIGTERM", "SIGUSR1", "SIGUSR2"]
 
-class NodeEnd:
+class NodeUpstreamEnd:
     """
-    A pluggable slot on the node for connecting edges.
+    A pluggable upstream slot on the node for connecting edges.
     """
     def connected(self) -> bool:
         """
@@ -86,24 +86,64 @@ class NodeEnd:
 
         Raises exception if the end is empty or closed.
         """
-    def __sub__(self, other: NodeEnd) -> None:
+    def __sub__(self, other: NodeDownstreamEnd) -> None:
         """
         Connect the two node ends. (overwrites)
         """
 
-class NodeInterface:
+class NodeDownstreamEnd:
     """
-    An upstream or downstream interface of a node.
-    
-    Conceptually an immutable list of `NodeEnd`s.
+    A pluggable downstream slot on the node for connecting edges.
     """
-    def __getitem__(self, index: int) -> NodeEnd:
+    def connected(self) -> bool:
+        """
+        `True` iff the end is connected.
+        """
+    def put_nowait(self, packet: Packet) -> None:
+        """
+        Put a packet into the edge the node end is connected to.
+
+        Raises exception if the end is empty, full, closed, 
+        or if connection is full (back pressured).
+        """
+    async def put(self, packet: Packet) -> None:
+        """
+        Put a packet into the edge the node end is connected to.
+
+        Raises exception if the end is empty or closed.
+        """
+    def __sub__(self, other: NodeUpstreamEnd) -> None:
+        """
+        Connect the two node ends. (overwrites)
+        """
+
+class NodeUpstreamInterface:
+    """
+    An upstream interface of a node, conceptually an immutable list of `NodeUpstreamEnd`s.
+    """
+    def __getitem__(self, index: int) -> NodeUpstreamEnd:
         ...
     def __len__(self) -> int:
-            ...
-    def __sub__(self, other: NodeInterface) -> None:
+        ...
+    def __sub__(self, other: NodeDownstreamInterface) -> None:
         """
-        Connects self disconnected slots to other disconnected slots in order,
+        Connects disconnected upstream slots to disconnected downstream slots in order,
+        until either side is full.
+
+        Does not overwrite existing connections.
+        """
+
+class NodeDownstreamInterface:
+    """
+    An downstream interface of a node, conceptually an immutable list of `NodeDownstreamEnd`s.
+    """
+    def __getitem__(self, index: int) -> NodeDownstreamEnd:
+        ...
+    def __len__(self) -> int:
+        ...
+    def __sub__(self, other: NodeUpstreamInterface) -> None:
+        """
+        Connects disconnected downstream slots to disconnected upstream slots in order,
         until either side is full.
 
         Does not overwrite existing connections.
@@ -115,40 +155,39 @@ class Node:
 
     All properties of this object gets a copied list.
     """
-    upstreams: list[NodeEnd]
-    downstreams: list[NodeEnd]
+    upstreams: NodeUpstreamInterface
+    downstreams: NodeDownstreamInterface
     def signal(self, signal: Signal):
         """
         Signal the node.
         """
-    def spawn(self):
+    def spawn(self) -> Signal | None:
         """
         Hand over thread, spawn runtime and run blocked.
         """
     def __rshift__(self, other: Node) -> Node:
         """
-        Connect self downstreams to other upstreams,
-        then merges.
+        Connect self downstreams to other upstreams, then merge.
         """
     def __lshift__(self, other: Node) -> Node:
         """
-        The symmetric operation of `__rshift__`
+        Connect self upstreams to other downstreams, then merge.
         """
     def __add__(self, other: Node) -> Node:
         """
-        Constructs a graph of the two nodes,
+        Construct a graph of the two nodes,
         or put a node into a graph,
         or merge the two graphs.
         """
     def __sub__(self, other: Node):
         """
-        Connects self downstream interface to other upstream interface.
+        Connect self downstream interface to other upstream interface.
         """
 
 def GraphNode() -> Node:
     """
     Graph, a special node. Runtime node service manager.
 
-    The upstream / downstream interface of this node is a list of the aggregated ends
-    of its nodes.
+    Nodes in a graph is ordered in a list. The upstream / downstream interface
+    of this node is a flattened list of ends of its nodes (thus mutable).
     """

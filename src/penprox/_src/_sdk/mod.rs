@@ -2,16 +2,16 @@
 pub mod sdk {
     use std::{any::Any, collections::HashMap, hash::{Hash, Hasher}, io::IsTerminal, net::{IpAddr, ToSocketAddrs}, pin::Pin, ptr, sync::{Arc, Mutex as MutexStd, OnceLock}, task::{Context, Poll}};
     use async_trait::async_trait;
-use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyFileNotFoundError, PyRuntimeError, PyValueError, PyIndexError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
-    use tokio::{sync::{Mutex as MutexTokio, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::TrySendError}}, task::{AbortHandle, JoinHandle, JoinSet}};
+    use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResult, exceptions::{PyBufferError, PyEOFError, PyFileNotFoundError, PyRuntimeError, PyValueError, PyIndexError}, prelude::*, pyclass, pymethods, types::{PyBytes, PyString}};
+    use tokio::{sync::{Mutex as MutexTokio, OwnedMutexGuard, Semaphore, mpsc::{Receiver, Sender, channel, error::{SendError, TrySendError}}}, task::{AbortHandle, JoinHandle, JoinSet}};
     use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
     pub const PACKET_BUFFER_SIZE: usize = 64;
     pub const SIGNAL_BUFFER_SIZE: usize = 8;
     #[pymodule_export]
     pub const PACKET_DATA_SIZE: usize = 2048;
-    /// Maximum amount of data packets a connection can safely buffer.
-    pub const CONNECTION_BUFFER_SIZE: usize = 64;
+    /// Maximum amount of data packets one connection side can safely buffer.
+    pub const CONNECTION_BUFFER_SIZE: usize = 32;
 
     #[derive(Clone, Debug)]
     pub enum LogDestination {
@@ -79,7 +79,7 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
     }
 
 
-    #[derive(FromPyObject, IntoPyObject, Clone)]
+    #[derive(FromPyObject, IntoPyObject, Clone, Debug)]
     pub enum Host {
         Domain(String),
         IpAddr(IpAddr)
@@ -147,7 +147,8 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         ip: OnceLock<IpAddr>,
         transport: Transport,
         port: u16,
-        buffer: Semaphore
+        downward: Semaphore,
+        upward: Semaphore
     }
 
     /// Strong reference, general representation of a connection.
@@ -167,14 +168,17 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
 
     impl Eq for ConnectionToken {}
     impl PartialEq for ConnectionToken {
-        // Connection is not `Pin`; Id is not exposed and should not be stored.
-        // \neq just guarantees the two compared, existing connection
-        // are not the same.
         #[allow(clippy::ptr_eq)]
         fn eq(&self, other: &Self) -> bool {
             self.0.as_ref() as *const Connection as usize == other.0.as_ref() as *const Connection as usize
         }
     }
+    // Clippy have been complaining a lot about this key type.
+    //
+    // It is mostly reasonable and this key should be used carefully.
+    // The hash is not a value comparison but an identity comparison.
+    // Moreover, this identity is guaranteed to be unique only within
+    // the connection's lifetime. Do not store it.
     impl Hash for ConnectionToken {
         fn hash<H: Hasher>(&self, state: &mut H) {
             state.write_usize(self.0.as_ref() as *const Connection as usize);
@@ -203,14 +207,16 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
                     ip: OnceLock::new(),
                     transport,
                     port,
-                    buffer: Semaphore::new(CONNECTION_BUFFER_SIZE)
+                    downward: Semaphore::new(CONNECTION_BUFFER_SIZE),
+                    upward: Semaphore::new(CONNECTION_BUFFER_SIZE)
                 })),
                 Host::IpAddr(ip_addr) => Self(Arc::new(Connection {
                     domain: None,
                     ip: OnceLock::from(ip_addr),
                     transport,
                     port,
-                    buffer: Semaphore::new(CONNECTION_BUFFER_SIZE)
+                    downward: Semaphore::new(CONNECTION_BUFFER_SIZE),
+                    upward: Semaphore::new(CONNECTION_BUFFER_SIZE)
                 }))
             }
         }
@@ -231,54 +237,131 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
     }
 
+    #[async_trait]
+    pub trait ConnectionAttached: Into<ConnectionDetached> + Send + Sized {
+        async fn new(connection: ConnectionToken, data: Box<[u8]>) -> Self;
+        fn try_new(connection: ConnectionToken, data: Box<[u8]>) -> Result<Self, (ConnectionToken, Box<[u8]>)>;
+        fn clone_detached(&self) -> ConnectionDetached;
+        fn connection(&self) -> &ConnectionToken;
+        fn data(&self) -> &[u8];
+        fn data_mut(&mut self) -> &mut Box<[u8]>;
+    }
+
     #[derive(Debug)]
-    pub struct ConnectionAttached {
+    pub struct ConnectionDownward {
         connection: ConnectionToken,
         pub data: Box<[u8]>
     }
 
-    impl Drop for ConnectionAttached {
+    impl Drop for ConnectionDownward {
         fn drop(&mut self) {
-            self.connection.0.buffer.add_permits(1);
+            self.connection.0.downward.add_permits(1);
         }
     }
 
-    impl ConnectionToken {
-        pub async fn attach(&self, data: Box<[u8]>) -> ConnectionAttached {
-            self.0.buffer.acquire().await.expect("Semaphore was closed").forget();
-            ConnectionAttached {
-                connection: self.clone(),
-                data
-            }
-        }
-        pub fn try_attach(&self, data: Box<[u8]>) -> Result<ConnectionAttached, Box<[u8]>> {
-            match self.0.buffer.try_acquire() {
-                Ok(permit) => {
-                    permit.forget();
-                    Ok(ConnectionAttached {
-                        connection: self.clone(),
-                        data
-                    })
-                },
-                Err(_) => Err(data)
-            }
-        }
-    }
-
-    impl ConnectionAttached {
-        /// Get the connection attached to.
-        /// 
-        /// This field is immutable for attached objects.
-        pub fn connection(&self) -> &ConnectionToken {
-            &self.connection
-        }
-        pub fn detach(self) -> ConnectionDetached {
-            let wrapper = std::mem::ManuallyDrop::new(self);
-            wrapper.connection.0.buffer.add_permits(1);
-            ConnectionDetached {
+    impl From<ConnectionDownward> for ConnectionDetached {
+        fn from(downward: ConnectionDownward) -> Self {
+            let wrapper = std::mem::ManuallyDrop::new(downward);
+            wrapper.connection.0.downward.add_permits(1);
+            Self {
                 connection: unsafe { ptr::read(&wrapper.connection) },
                 data: unsafe { ptr::read(&wrapper.data) }
             }
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionAttached for ConnectionDownward {
+        async fn new(connection: ConnectionToken, data: Box<[u8]>) -> Self {
+            connection.0.downward.acquire().await.expect("Semaphore was closed").forget();
+            Self {
+                connection,
+                data
+            }
+        }
+        fn try_new(connection: ConnectionToken, data: Box<[u8]>) -> Result<Self, (ConnectionToken, Box<[u8]>)> {
+            let Ok(permit) = connection.0.downward.try_acquire() else {
+                return Err((connection, data))
+            };
+            permit.forget();
+            Ok(Self {
+                connection,
+                data
+            })
+        }
+        fn clone_detached(&self) -> ConnectionDetached {
+            ConnectionDetached {
+                connection: self.connection.clone(),
+                data: self.data.clone()
+            }
+        }
+        fn connection(&self) -> &ConnectionToken {
+            &self.connection
+        }
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+        fn data_mut(&mut self) -> &mut Box<[u8]> {
+            &mut self.data
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ConnectionUpward {
+        connection: ConnectionToken,
+        pub data: Box<[u8]>
+    }
+
+    impl Drop for ConnectionUpward {
+        fn drop(&mut self) {
+            self.connection.0.upward.add_permits(1);
+        }
+    }
+    
+    impl From<ConnectionUpward> for ConnectionDetached {
+        fn from(upward: ConnectionUpward) -> Self {
+            let wrapper = std::mem::ManuallyDrop::new(upward);
+            wrapper.connection.0.upward.add_permits(1);
+            Self {
+                connection: unsafe { ptr::read(&wrapper.connection) },
+                data: unsafe { ptr::read(&wrapper.data) }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionAttached for ConnectionUpward {
+        async fn new(connection: ConnectionToken, data: Box<[u8]>) -> Self {
+            connection.0.upward.acquire().await.expect("Semaphore was closed").forget();
+            Self {
+                connection,
+                data
+            }
+        }
+        fn try_new(connection: ConnectionToken, data: Box<[u8]>) -> Result<Self, (ConnectionToken, Box<[u8]>)> {
+            let Ok(permit) = connection.0.upward.try_acquire() else {
+                return Err((connection, data));
+            };
+            permit.forget();
+            Ok(Self {
+                connection,
+                data
+            })
+        }
+        fn clone_detached(&self) -> ConnectionDetached {
+            ConnectionDetached {
+                connection: self.connection.clone(),
+                data: self.data.clone()
+            }
+        }
+        fn connection(&self) -> &ConnectionToken {
+            &self.connection
+        }
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+        fn data_mut(&mut self) -> &mut Box<[u8]> {
+            &mut self.data
         }
     }
 
@@ -295,16 +378,16 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
                 data
             }
         }
-        pub async fn attach(self) -> ConnectionAttached {
-            self.connection.0.buffer.acquire().await.expect("Semaphore was closed").forget();
-            ConnectionAttached {
+        pub async fn into_downward(self) -> ConnectionDownward {
+            self.connection.0.downward.acquire().await.expect("Semaphore was closed").forget();
+            ConnectionDownward {
                 connection: self.connection,
                 data: self.data
             }
         }
-        pub fn try_attach(self) -> Result<ConnectionAttached, Self> {
+        pub fn try_into_downward(self) -> Result<ConnectionDownward, Self> {
             let result = {
-                match self.connection.0.buffer.try_acquire() {
+                match self.connection.0.downward.try_acquire() {
                     Ok(permit) => {
                         permit.forget();
                         true
@@ -313,7 +396,32 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
                 }
             };
             match result {
-                true => Ok(ConnectionAttached {
+                true => Ok(ConnectionDownward {
+                    connection: self.connection,
+                    data: self.data
+                }),
+                false => Err(self)
+            }
+        }
+        pub async fn into_upward(self) -> ConnectionUpward {
+            self.connection.0.upward.acquire().await.expect("Semaphore was closed").forget();
+            ConnectionUpward {
+                connection: self.connection,
+                data: self.data
+            }
+        }
+        pub fn try_into_upward(self) -> Result<ConnectionUpward, Self> {
+            let result = {
+                match self.connection.0.upward.try_acquire() {
+                    Ok(permit) => {
+                        permit.forget();
+                        true
+                    },
+                    Err(_) => false
+                }
+            };
+            match result {
+                true => Ok(ConnectionUpward {
                     connection: self.connection,
                     data: self.data
                 }),
@@ -322,45 +430,141 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
     }
 
+    
+    #[async_trait]
+    pub trait AttachedPacket: Into<DetachedPacket> + Send + Sized {
+        fn new_syn(connection: ConnectionToken) -> Self;
+        fn new_fin(connection: ConnectionToken) -> Self;
+        async fn new_data(connection: ConnectionToken, data: Box<[u8]>) -> Self;
+        fn try_new_data(connection: ConnectionToken, data: Box<[u8]>) -> Result<Self, (ConnectionToken, Box<[u8]>)>;
+        fn clone_detached(&self) -> DetachedPacket;
+        fn connection(&self) -> &ConnectionToken;
+        fn data(&self) -> Option<&[u8]>;
+        fn data_mut(&mut self) -> Option<&mut Box<[u8]>>;
+        fn is_syn(&self) -> bool;
+        fn is_fin(&self) -> bool;
+        fn is_data(&self) -> bool;
+    }
+
     #[derive(Debug)]
-    pub enum Packet {
+    pub enum DownwardPacket {
         SYN(ConnectionToken),
-        Data(ConnectionAttached),
+        Data(ConnectionDownward),
         FIN(ConnectionToken)
     }
 
-    impl Packet {
-        pub fn detach(self) -> DetachedPacket {
-            match self {
-                Packet::SYN(connection) => DetachedPacket::SYN(connection),
-                Packet::Data(attached) => DetachedPacket::Data(attached.detach()),
-                Packet::FIN(connection) => DetachedPacket::FIN(connection)
-            }
+    #[async_trait]
+    impl AttachedPacket for DownwardPacket {
+        fn new_syn(connection: ConnectionToken) -> Self {
+            Self::SYN(connection)
         }
-        pub fn clone_detached(&self) -> DetachedPacket {
+        async fn new_data(connection: ConnectionToken, data: Box<[u8]>) -> Self {
+            Self::Data(ConnectionDownward::new(connection, data).await)
+        }
+        fn try_new_data(connection: ConnectionToken, data: Box<[u8]>) -> Result<Self, (ConnectionToken, Box<[u8]>)> {
+            Ok(Self::Data(ConnectionDownward::try_new(connection, data)?))
+        }
+        fn new_fin(connection: ConnectionToken) -> Self {
+            Self::FIN(connection)
+        }
+        fn clone_detached(&self) -> DetachedPacket {
             match self {
-                Packet::SYN(connection) => DetachedPacket::SYN(connection.clone()),
-                Packet::Data(attached) => DetachedPacket::Data(ConnectionDetached {
-                    connection: attached.connection().clone(),
-                    data: attached.data.clone()
+                Self::SYN(connection) => DetachedPacket::SYN(connection.clone()),
+                Self::Data(downward) => DetachedPacket::Data(ConnectionDetached {
+                    connection: downward.connection().clone(),
+                    data: downward.data.clone()
                 }),
-                Packet::FIN(connection) => DetachedPacket::FIN(connection.clone())
+                Self::FIN(connection) => DetachedPacket::FIN(connection.clone())
             }
         }
-        pub fn connection(&self) -> &ConnectionToken {
+        fn connection(&self) -> &ConnectionToken {
             match self {
-                Packet::SYN(token) => token,
-                Packet::Data(attached) => attached.connection(),
-                Packet::FIN(token) => token
+                Self::SYN(token) => token,
+                Self::Data(downward) => downward.connection(),
+                Self::FIN(token) => token
             }
         }
-        pub fn is_syn(&self) -> bool {
+        fn data(&self) -> Option<&[u8]> {
+            if let Self::Data(downward) = self {
+                return Some(downward.data());
+            }
+            None
+        }
+        fn data_mut(&mut self) -> Option<&mut Box<[u8]>> {
+            if let Self::Data(downward) = self {
+                return Some(downward.data_mut());
+            }
+            None
+        }
+        fn is_syn(&self) -> bool {
             matches!(self, Self::SYN(_))
         }
-        pub fn is_data(&self) -> bool {
+        fn is_data(&self) -> bool {
             matches!(self, Self::Data(_))
         }
-        pub fn is_fin(&self) -> bool {
+        fn is_fin(&self) -> bool {
+            matches!(self, Self::FIN(_))
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum UpwardPacket {
+        /// Usually you shouldn't need this
+        SYN(ConnectionToken),
+        Data(ConnectionUpward),
+        FIN(ConnectionToken)
+    }
+
+    #[async_trait]
+    impl AttachedPacket for UpwardPacket {
+        fn new_syn(connection: ConnectionToken) -> Self {
+            Self::SYN(connection)
+        }
+        async fn new_data(connection: ConnectionToken, data: Box<[u8]>) -> Self {
+            Self::Data(ConnectionUpward::new(connection, data).await)
+        }
+        fn try_new_data(connection: ConnectionToken, data: Box<[u8]>) -> Result<Self, (ConnectionToken, Box<[u8]>)> {
+            Ok(Self::Data(ConnectionUpward::try_new(connection, data)?))
+        }
+        fn new_fin(connection: ConnectionToken) -> Self {
+            Self::FIN(connection)
+        }
+        fn clone_detached(&self) -> DetachedPacket {
+            match self {
+                Self::SYN(connection) => DetachedPacket::SYN(connection.clone()),
+                Self::Data(upward) => DetachedPacket::Data(ConnectionDetached {
+                    connection: upward.connection().clone(),
+                    data: upward.data.clone()
+                }),
+                Self::FIN(connection) => DetachedPacket::FIN(connection.clone())
+            }
+        }
+        fn connection(&self) -> &ConnectionToken {
+            match self {
+                Self::SYN(token) => token,
+                Self::Data(upward) => upward.connection(),
+                Self::FIN(token) => token
+            }
+        }
+        fn data(&self) -> Option<&[u8]> {
+            if let Self::Data(upward) = self {
+                return Some(upward.data());
+            }
+            None
+        }
+        fn data_mut(&mut self) -> Option<&mut Box<[u8]>> {
+            if let Self::Data(upward) = self {
+                return Some(upward.data_mut());
+            }
+            None
+        }
+        fn is_syn(&self) -> bool {
+            matches!(self, Self::SYN(_))
+        }
+        fn is_data(&self) -> bool {
+            matches!(self, Self::Data(_))
+        }
+        fn is_fin(&self) -> bool {
             matches!(self, Self::FIN(_))
         }
     }
@@ -373,28 +577,38 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
     }
 
     impl DetachedPacket {
-        pub async fn attach(self) -> Packet {
+        pub async fn into_downward(self) -> DownwardPacket {
             match self {
-                Self::SYN(connection) => Packet::SYN(connection),
-                Self::Data(detached) => Packet::Data(detached.attach().await),
-                Self::FIN(connection) => Packet::FIN(connection)
+                Self::SYN(connection) => DownwardPacket::SYN(connection),
+                Self::Data(detached) => DownwardPacket::Data(detached.into_downward().await),
+                Self::FIN(connection) => DownwardPacket::FIN(connection)
             }
         }
-        pub fn try_attach(self) -> Result<Packet, Self> {
+        pub fn try_into_downward(self) -> Result<DownwardPacket, Self> {
             match self {
-                Self::SYN(connection) => Ok(Packet::SYN(connection)),
-                Self::Data(detached) => match detached.try_attach() {
-                    Ok(attached) => Ok(Packet::Data(attached)),
+                Self::SYN(connection) => Ok(DownwardPacket::SYN(connection)),
+                Self::Data(detached) => match detached.try_into_downward() {
+                    Ok(downward) => Ok(DownwardPacket::Data(downward)),
                     Err(detached) => Err(Self::Data(detached))
                 },
-                Self::FIN(connection) => Ok(Packet::FIN(connection))
+                Self::FIN(connection) => Ok(DownwardPacket::FIN(connection))
             }
         }
-        pub fn connection(&self) -> &ConnectionToken {
+        pub async fn into_upward(self) -> UpwardPacket {
             match self {
-                DetachedPacket::SYN(token) => token,
-                DetachedPacket::Data(attached) => &attached.connection,
-                DetachedPacket::FIN(token) => token
+                Self::SYN(connection) => UpwardPacket::SYN(connection),
+                Self::Data(detached) => UpwardPacket::Data(detached.into_upward().await),
+                Self::FIN(connection) => UpwardPacket::FIN(connection)
+            }
+        }
+        pub fn try_into_upward(self) -> Result<UpwardPacket, Self> {
+            match self {
+                Self::SYN(connection) => Ok(UpwardPacket::SYN(connection)),
+                Self::Data(detached) => match detached.try_into_upward() {
+                    Ok(upward) => Ok(UpwardPacket::Data(upward)),
+                    Err(detached) => Err(Self::Data(detached))
+                },
+                Self::FIN(connection) => Ok(UpwardPacket::FIN(connection))
             }
         }
         pub fn is_syn(&self) -> bool {
@@ -408,41 +622,55 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
     }
 
-    impl<'a, 'py> FromPyObject<'a, 'py> for DetachedPacket {
-        type Error = PyErr;
-        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-            match obj.extract::<PyPacket>() {
-                Ok(obj) => match obj.payload {
-                    PyPayload::SYN => Ok(DetachedPacket::SYN(obj.connection)),
-                    PyPayload::Data(data) => Ok(DetachedPacket::Data(ConnectionDetached { connection: obj.connection, data })),
-                    PyPayload::FIN => Ok(DetachedPacket::FIN(obj.connection))
-                },
-                _ => Err(PyValueError::new_err("Invalid packet"))
+    impl From<DownwardPacket> for DetachedPacket {
+        fn from(downward: DownwardPacket) -> Self {
+            match downward {
+                DownwardPacket::SYN(connection) => Self::SYN(connection),
+                DownwardPacket::Data(downward) => Self::Data(downward.into()),
+                DownwardPacket::FIN(connection) => Self::FIN(connection)
             }
         }
     }
 
-    impl<'py> IntoPyObject<'py> for DetachedPacket {
-        type Error = PyErr;
-        type Target = PyAny;
-        type Output = Bound<'py, Self::Target>;
-        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-            let py_packet = match self {
-                Self::SYN(connection) => PyPacket {
-                    connection,
-                    payload: PyPayload::SYN
-                },
-                Self::Data(detached) => PyPacket {
-                    connection: detached.connection,
-                    payload: PyPayload::Data(detached.data)
-                },
-                Self::FIN(connection) => PyPacket {
-                    connection,
-                    payload: PyPayload::FIN
-                }
-            };
-            py_packet.into_bound_py_any(py)
+    impl From<UpwardPacket> for DetachedPacket {
+        fn from(upward: UpwardPacket) -> Self {
+            match upward {
+                UpwardPacket::SYN(connection) => Self::SYN(connection),
+                UpwardPacket::Data(upward) => Self::Data(upward.into()),
+                UpwardPacket::FIN(connection) => Self::FIN(connection)
+            }
         }
+    }
+
+    /// A type parameter for bidirectional compatible structures
+    pub trait Direction: 'static + Default + Copy + Clone + Send + Sync {
+        type ForwardPacket: AttachedPacket;
+        type BackwardPacket: AttachedPacket;
+        type ConnectionForward: ConnectionAttached;
+        type ConnectionBackward: ConnectionAttached;
+        type Reverse: Direction;
+    }
+
+    /// Type parameter for downward use of a bidirectional compatible structure
+    #[derive(Default, Copy, Clone)]
+    pub struct Downward;
+    /// Type parameter for upward use of a bidirectional compatible structure
+    #[derive(Default, Copy, Clone)]
+    pub struct Upward;
+
+    impl Direction for Downward {
+        type ForwardPacket = DownwardPacket;
+        type BackwardPacket = UpwardPacket;
+        type ConnectionForward = ConnectionDownward;
+        type ConnectionBackward = ConnectionUpward;
+        type Reverse = Upward;
+    }
+    impl Direction for Upward {
+        type ForwardPacket = UpwardPacket;
+        type BackwardPacket = DownwardPacket;
+        type ConnectionForward = ConnectionUpward;
+        type ConnectionBackward = ConnectionDownward;
+        type Reverse = Downward;
     }
 
     /// Internal python payload type, as native `"SYN" | "FIN" | bytes`.
@@ -501,6 +729,43 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         payload: PyPayload
     }
 
+    impl<'a, 'py> FromPyObject<'a, 'py> for DetachedPacket {
+        type Error = PyErr;
+        fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+            match obj.extract::<PyPacket>() {
+                Ok(obj) => match obj.payload {
+                    PyPayload::SYN => Ok(DetachedPacket::SYN(obj.connection)),
+                    PyPayload::Data(data) => Ok(DetachedPacket::Data(ConnectionDetached { connection: obj.connection, data })),
+                    PyPayload::FIN => Ok(DetachedPacket::FIN(obj.connection))
+                },
+                _ => Err(PyValueError::new_err("Invalid packet"))
+            }
+        }
+    }
+
+    impl<'py> IntoPyObject<'py> for DetachedPacket {
+        type Error = PyErr;
+        type Target = PyAny;
+        type Output = Bound<'py, Self::Target>;
+        fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+            let py_packet = match self {
+                Self::SYN(connection) => PyPacket {
+                    connection,
+                    payload: PyPayload::SYN
+                },
+                Self::Data(detached) => PyPacket {
+                    connection: detached.connection,
+                    payload: PyPayload::Data(detached.data)
+                },
+                Self::FIN(connection) => PyPacket {
+                    connection,
+                    payload: PyPayload::FIN
+                }
+            };
+            py_packet.into_bound_py_any(py)
+        }
+    }
+
     /// Unidirectional control message with high scheduling priority.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum Signal {
@@ -547,18 +812,19 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
     }
 
-    pub trait Drain {
-        fn drain(&mut self);
+    pub trait Clear {
+        fn clear(&mut self);
     }
 
-    impl Drain for Receiver<Signal> {
+    impl Clear for Receiver<Signal> {
         /// Does what you think
-        fn drain(&mut self) {
+        fn clear(&mut self) {
             while self.try_recv().is_ok() {}
         }
     }
 
-    #[derive(Debug)]
+    /// Error representing the token (shared reference) cannot be dereferenced
+    #[derive(Debug, Copy, Clone)]
     pub enum TokenAccessError {
         Occupied,
         Empty
@@ -584,7 +850,8 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
     }
 
-    #[derive(Debug)]
+    /// Error representing the node service is interrupted by an external graph exception
+    #[derive(Debug, Copy, Clone)]
     pub enum GraphError {
         Disconnected,
         Occupied,
@@ -622,43 +889,49 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
     }
 
+    impl<T> From<SendError<T>> for GraphError {
+        fn from(_: SendError<T>) -> Self {
+            Self::Disconnected
+        }
+    }
+
     #[derive(Debug)]
-    struct NodeEnd {
-        sender: Sender<Packet>,
-        receiver: Arc<MutexTokio<Receiver<Packet>>> // This ArcMutex clones long held OwnedMutex token
+    struct NodeUpstreamEnd {
+        sender: Sender<UpwardPacket>,
+        receiver: Arc<MutexTokio<Receiver<DownwardPacket>>> // This ArcMutex clones long held OwnedMutex token
     }
 
     /// General representation of a node end. Can be empty (disconnected).
-    #[pyclass(from_py_object, name="NodeEnd")]
+    #[pyclass(from_py_object, name="NodeUpstreamEnd")]
     #[derive(Clone, Debug, Default)]
-    pub struct NodeEndToken(Arc<MutexStd<Option<NodeEnd>>>); // This Mutex is always short held
+    pub struct NodeUpstreamEndToken(Arc<MutexStd<Option<NodeUpstreamEnd>>>); // This Mutex is always short held
 
-    impl NodeEndToken {
+    impl NodeUpstreamEndToken {
         /// Initialize a new, disconnected node end.
         pub fn new() -> Self {
             Self(Arc::new(MutexStd::new(None)))
         }
         /// Get receiver.
-        pub fn sender(&self) -> Result<Sender<Packet>, TokenAccessError> {
+        pub fn sender(&self) -> Result<Sender<UpwardPacket>, TokenAccessError> {
             let guard = self.0.lock().expect("End is poisoned");
             Ok(guard.as_ref().ok_or(TokenAccessError::Empty)?.sender.clone())
         }
         /// Get receiver.
-        pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<Packet>>, TokenAccessError> {
+        pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<DownwardPacket>>, TokenAccessError> {
             let guard = self.0.lock().expect("End is poisoned");
             guard.as_ref().ok_or(TokenAccessError::Empty)?.receiver.clone().try_lock_owned().map_err(|_| TokenAccessError::Occupied)
         }
         /// Connect the two ends. Overwrites.
-        pub fn connect(&self, other: &Self) {
-            let mut slf = self.0.lock().expect("End is poisoned");
-            let mut other = other.0.lock().expect("End is poisoned");
+        pub fn connect(&self, downstream: &NodeDownstreamEndToken) {
+            let mut upstream = self.0.lock().expect("End is poisoned");
+            let mut downstream = downstream.0.lock().expect("End is poisoned");
             let (sender1, receiver1) = channel(PACKET_BUFFER_SIZE);
             let (sender2, receiver2) = channel(PACKET_BUFFER_SIZE);
-            *slf = Some(NodeEnd {
+            *upstream = Some(NodeUpstreamEnd {
                 sender: sender1,
                 receiver: Arc::new(MutexTokio::new(receiver2))
             });
-            *other = Some(NodeEnd {
+            *downstream = Some(NodeDownstreamEnd {
                 sender: sender2,
                 receiver: Arc::new(MutexTokio::new(receiver1))
             });
@@ -666,13 +939,13 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
     }
 
     #[pymethods]
-    impl NodeEndToken {
+    impl NodeUpstreamEndToken {
         pub fn connected(&self) -> bool {
             let guard = self.0.lock().expect("End is poisoned");
             guard.is_some()
         }
         fn put_nowait(&self, packet: DetachedPacket) -> PyResult<()> {
-            let Ok(packet) = packet.try_attach() else {
+            let Ok(packet) = packet.try_into_upward() else {
                 return Err(PyBufferError::new_err("Cannot put new packet into the graph"))
             };
             let sender = self.sender().map_err(PyErr::from)?;
@@ -688,28 +961,95 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         }
         /// This method will await if the connection reached its data packet count limit.
         async fn put(&self, packet: DetachedPacket) -> PyResult<()> {
-            let packet = packet.attach().await;
+            let packet = packet.into_upward().await;
             let sender = self.sender().map_err(PyErr::from)?;
             match sender.send(packet).await {
                 Ok(_) => Ok(()),
                 _ => Err(PyEOFError::new_err("End is closed"))
             }
         }
-        /// `NodeEndToken::connect`
-        fn __sub__(&self, other: &Self) {
+        /// `NodeUpstreamEndToken::connect`
+        fn __sub__(&self, other: &NodeDownstreamEndToken) {
             self.connect(other);
         }
     }
 
-    /// An immutable upstream / downstream interface of a node.
+    #[derive(Debug)]
+    struct NodeDownstreamEnd {
+        sender: Sender<DownwardPacket>,
+        receiver: Arc<MutexTokio<Receiver<UpwardPacket>>> // This ArcMutex clones long held OwnedMutex token
+    }
+
+    /// General representation of a node end. Can be empty (disconnected).
+    #[pyclass(from_py_object, name="NodeDownstreamEnd")]
+    #[derive(Clone, Debug, Default)]
+    pub struct NodeDownstreamEndToken(Arc<MutexStd<Option<NodeDownstreamEnd>>>); // This Mutex is always short held
+
+    impl NodeDownstreamEndToken {
+        /// Initialize a new, disconnected node end.
+        pub fn new() -> Self {
+            Self(Arc::new(MutexStd::new(None)))
+        }
+        /// Get receiver.
+        pub fn sender(&self) -> Result<Sender<DownwardPacket>, TokenAccessError> {
+            let guard = self.0.lock().expect("End is poisoned");
+            Ok(guard.as_ref().ok_or(TokenAccessError::Empty)?.sender.clone())
+        }
+        /// Get receiver.
+        pub fn receiver(&self) -> Result<OwnedMutexGuard<Receiver<UpwardPacket>>, TokenAccessError> {
+            let guard = self.0.lock().expect("End is poisoned");
+            guard.as_ref().ok_or(TokenAccessError::Empty)?.receiver.clone().try_lock_owned().map_err(|_| TokenAccessError::Occupied)
+        }
+        /// Connect the two ends. Overwrites.
+        pub fn connect(&self, upstream: &NodeUpstreamEndToken) {
+            upstream.connect(self)
+        }
+    }
+
+    #[pymethods]
+    impl NodeDownstreamEndToken {
+        pub fn connected(&self) -> bool {
+            let guard = self.0.lock().expect("End is poisoned");
+            guard.is_some()
+        }
+        fn put_nowait(&self, packet: DetachedPacket) -> PyResult<()> {
+            let Ok(packet) = packet.try_into_downward() else {
+                return Err(PyBufferError::new_err("Cannot put new packet into the graph"))
+            };
+            let sender = self.sender().map_err(PyErr::from)?;
+            match sender.try_send(packet) {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    match err {
+                        TrySendError::Closed(_) => Err(PyEOFError::new_err("End is closed")),
+                        TrySendError::Full(_) => Err(PyBufferError::new_err("End is full")) 
+                    }
+                }
+            }
+        }
+        /// This method will await if the connection reached its data packet count limit.
+        async fn put(&self, packet: DetachedPacket) -> PyResult<()> {
+            let packet = packet.into_downward().await;
+            let sender = self.sender().map_err(PyErr::from)?;
+            match sender.send(packet).await {
+                Ok(_) => Ok(()),
+                _ => Err(PyEOFError::new_err("End is closed"))
+            }
+        }
+        /// `NodeUpstreamEndToken::connect`
+        fn __sub__(&self, other: &NodeUpstreamEndToken) {
+            self.connect(other);
+        }
+    }
+
+    /// An immutable upstream interface of a node.
     #[pyclass(from_py_object)]
     #[derive(Clone, Debug)]
-    pub struct NodeInterface(Arc<MutexStd<Vec<NodeEndToken>>>); // This Mutex is always short held
+    pub struct NodeUpstreamInterface(Arc<MutexStd<Vec<NodeUpstreamEndToken>>>); // This Mutex is always short held
 
-    impl NodeInterface {
-        pub fn new(ends: Vec<NodeEndToken>) -> Self {
+    impl NodeUpstreamInterface {
+        pub fn new(ends: Vec<NodeUpstreamEndToken>) -> Self {
             Self(Arc::new(MutexStd::new(ends)))
-        
         }
         pub fn is_empty(&self) -> bool {
             let guard = self.0.lock().expect("Interface is poisoned");
@@ -720,58 +1060,107 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
             guard.len()
         }
         /// This is always `Some` unless index out of bounds
-        pub fn get(&self, index: usize) -> Option<NodeEndToken> {
+        pub fn get(&self, index: usize) -> Option<NodeUpstreamEndToken> {
             let guard = self.0.lock().expect("Interface is poisoned");
             guard.get(index).cloned()
         }
         /// Clone inside.
         /// 
-        /// This is usually fine to use for immutable `NodeInterface`.
-        pub fn get_all(&self) -> Vec<NodeEndToken> {
+        /// This is usually fine to use for immutable `NodeUpstreamInterface`.
+        pub fn get_all(&self) -> Vec<NodeUpstreamEndToken> {
             let guard = self.0.lock().expect("Interface is poisoned");
             guard.clone()
         }
         /// Connect two interfaces in order until either side is full. Does not overwrite connected ends.
-        pub fn connect(&self, other: &Self) -> Result<(), TokenAccessError> {
-            let self_disconnected_indices = {
-                let self_guard = self.0.lock().map_err(|_| TokenAccessError::Occupied)?;
+        pub fn connect(&self, downstream: &NodeDownstreamInterface) -> Result<(), TokenAccessError> {
+            let upstream_disconnected_indices = {
+                let upstream_guard = self.0.lock().map_err(|_| TokenAccessError::Occupied)?;
                 let mut indices = Vec::new();
-                for (index, self_end) in self_guard.iter().enumerate() {
-                    if !self_end.connected() {
+                for (index, upstream_end) in upstream_guard.iter().enumerate() {
+                    if !upstream_end.connected() {
                         indices.push(index);
                     }
                 }
                 indices
             };
-            let other_disconnected_indices = {
-                let other_guard = other.0.lock().map_err(|_| TokenAccessError::Occupied)?;
+            let downstream_disconnected_indices = {
+                let downstream_guard = downstream.0.lock().map_err(|_| TokenAccessError::Occupied)?;
                 let mut indices = Vec::new();
-                for (index, other_end) in other_guard.iter().enumerate() {
-                    if !other_end.connected() {
+                for (index, downstream_end) in downstream_guard.iter().enumerate() {
+                    if !downstream_end.connected() {
                         indices.push(index);
                     }
                 }
                 indices
             };
-            for (self_index, other_index) in self_disconnected_indices.into_iter().zip(other_disconnected_indices) {
-                let downstream = self.get(self_index).expect("Getting an out of bound enumerated index");
-                let upstream = other.get(other_index).expect("Getting an out of bound enumerated index");
-                NodeEndToken::connect(&downstream, &upstream);
+            for (upstream_index, downstream_index) in upstream_disconnected_indices.into_iter().zip(downstream_disconnected_indices) {
+                let upstream = self.get(upstream_index).expect("Getting an out of bound enumerated index");
+                let downstream = downstream.get(downstream_index).expect("Getting an out of bound enumerated index");
+                upstream.connect(&downstream);
             }
             Ok(())
         }
     }
 
     #[pymethods]
-    impl NodeInterface {
-        fn __getitem__(&self, index: usize) -> PyResult<NodeEndToken> {
+    impl NodeUpstreamInterface {
+        fn __getitem__(&self, index: usize) -> PyResult<NodeUpstreamEndToken> {
+            self.get(index).ok_or(PyIndexError::new_err("Node end index out of bounds"))
+        }
+        fn __len__(&self) -> usize {
+            self.len()
+        }
+        /// `NodeUpstreamInterface::connect`
+        fn __sub__(&self, other: &NodeDownstreamInterface) -> PyResult<()> {
+            self.connect(other).map_err(PyErr::from)
+        }
+    }
+
+    /// An immutable downstream interface of a node.
+    #[pyclass(from_py_object)]
+    #[derive(Clone, Debug)]
+    pub struct NodeDownstreamInterface(Arc<MutexStd<Vec<NodeDownstreamEndToken>>>); // This Mutex is always short held
+
+    impl NodeDownstreamInterface {
+        pub fn new(ends: Vec<NodeDownstreamEndToken>) -> Self {
+            Self(Arc::new(MutexStd::new(ends)))
+        }
+        pub fn is_empty(&self) -> bool {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.is_empty()
+        }
+        pub fn len(&self) -> usize {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.len()
+        }
+        /// This is always `Some` unless index out of bounds
+        pub fn get(&self, index: usize) -> Option<NodeDownstreamEndToken> {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.get(index).cloned()
+        }
+        /// Clone inside.
+        /// 
+        /// This is usually fine to use for immutable `NodeDownstreamInterface`.
+        pub fn get_all(&self) -> Vec<NodeDownstreamEndToken> {
+            let guard = self.0.lock().expect("Interface is poisoned");
+            guard.clone()
+        }
+        /// Connect two interfaces in order until either side is full. Does not overwrite connected ends.
+        pub fn connect(&self, upstream: &NodeUpstreamInterface) -> Result<(), TokenAccessError> {
+            upstream.connect(self)
+        }
+    }
+
+    #[pymethods]
+    impl NodeDownstreamInterface {
+        fn __getitem__(&self, index: usize) -> PyResult<NodeDownstreamEndToken> {
             self.get(index).ok_or(PyIndexError::new_err("Node end index out of bounds"))
         }
         fn __len__(&self) -> usize {
             self.len()
         }
         /// `NodeInterface::connect`
-        fn __sub__(&self, other: &Self) -> PyResult<()> {
+        fn __sub__(&self, other: &NodeUpstreamInterface) -> PyResult<()> {
             self.connect(other).map_err(PyErr::from)
         }
     }
@@ -791,12 +1180,12 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
     pub struct NodeToken {
         node: Arc<MutexTokio<Box<dyn Node>>>,
         signal_sender: Sender<Signal>,
-        upstreams: NodeInterface,
-        downstreams: NodeInterface
+        upstreams: NodeUpstreamInterface,
+        downstreams: NodeDownstreamInterface
     }
 
     impl NodeToken {
-        pub fn new(node: Box<dyn Node>, signal_sender: Sender<Signal>, upstreams: NodeInterface, downstreams: NodeInterface) -> Self {
+        pub fn new(node: Box<dyn Node>, signal_sender: Sender<Signal>, upstreams: NodeUpstreamInterface, downstreams: NodeDownstreamInterface) -> Self {
             Self {
                 node: Arc::new(MutexTokio::new(node)),
                 signal_sender,
@@ -856,11 +1245,11 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
             let _ = self.signal_sender.try_send(signal); // Silently fail for this last resort
         }
         #[getter]
-        pub fn upstreams(&self) -> NodeInterface {
+        pub fn upstreams(&self) -> NodeUpstreamInterface {
             self.upstreams.clone()
         }
         #[getter]
-        pub fn downstreams(&self) -> NodeInterface {
+        pub fn downstreams(&self) -> NodeDownstreamInterface {
             self.downstreams.clone()
         }
         /// Hand over thread, spawn tokio runtime and run blocked.
@@ -873,8 +1262,9 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         fn __add__(&self, other: &Self) -> PyResult<Self> {
             Self::merge(self, other).map_err(|error| PyRuntimeError::new_err(error.to_string()))
         }
+        /// This method is oriented
         fn __sub__(&self, other: &Self) -> PyResult<()> {
-            NodeInterface::connect(&self.downstreams, &other.upstreams).map_err(PyErr::from)
+            self.downstreams.connect(&other.upstreams).map_err(PyErr::from)
         }
         fn __rshift__(&self, other: &Self) -> PyResult<Self> {
             self.__sub__(other)?;
@@ -901,7 +1291,7 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
     impl Node for GraphNode {
         #[tracing::instrument(name="GraphNode::run", skip_all)]
         async fn run(&mut self) -> Result<Option<Signal>, GraphError> {
-            self.signal_receiver.drain();
+            self.signal_receiver.clear();
             for token in &self.nodes {
                 if token.node.try_lock().is_err() {
                     tracing::error!("Nodes are already running");
@@ -966,7 +1356,7 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
         fn nodes(&mut self) -> &mut Vec<NodeToken> {
             &mut self.nodes
         }
-        fn update_upstreams_downstreams(&self, upstreams: &NodeInterface, downstreams: &NodeInterface) {
+        fn update_upstreams_downstreams(&self, upstreams: &NodeUpstreamInterface, downstreams: &NodeDownstreamInterface) {
             let mut new_upstreams = Vec::new();
             let mut new_downstreams = Vec::new();
             for node in &self.nodes {
@@ -997,8 +1387,8 @@ use pyo3::{Borrowed, FromPyObject, IntoPyObject, IntoPyObjectExt, PyErr, PyResul
                 nodes,
                 signal_receiver
             };
-            let upstreams = NodeInterface(Arc::new(MutexStd::new(Vec::new())));
-            let downstreams = NodeInterface(Arc::new(MutexStd::new(Vec::new())));
+            let upstreams = NodeUpstreamInterface(Arc::new(MutexStd::new(Vec::new())));
+            let downstreams = NodeDownstreamInterface(Arc::new(MutexStd::new(Vec::new())));
             graph_node.update_upstreams_downstreams(&upstreams, &downstreams);
             NodeToken {
                 node: Arc::new(MutexTokio::new(Box::new(graph_node))),
