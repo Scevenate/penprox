@@ -1,15 +1,23 @@
-# Register submodules
+from .crate.penprox import *  # noqa: I001
 
-import sys as _sys
 
-from ._src import penprox as _penprox
 
-for _name in ("common", "sdk", "socks5"):
-    _sys.modules[f"{__name__}._src.penprox.{_name}"] = getattr(_penprox, _name)
 
-del _name, _penprox, _sys
+from collections.abc import Awaitable, Callable
+from typing import Literal
 
-# Import basic objects
+from .crate.penprox import Packet
 
-from .common import *
-from .sdk import *
+
+type Signal = Literal["SIGTERM", "SIGUSR1", "SIGUSR2"]
+
+type PacketType = Literal["Detached", "Upward", "Downward"]
+
+type PacketPayload = Literal["SYN", "FIN"] | bytes
+
+type PythonNodeCallbackArg = tuple[Signal, Literal[0]] | tuple[Packet, int]
+
+type PythonNodeCallbackReturn = bool | Signal
+
+type PythonNodeCallback = Callable[[PythonNodeCallbackArg], PythonNodeCallbackReturn | Awaitable[PythonNodeCallbackReturn]]
+

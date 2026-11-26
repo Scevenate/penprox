@@ -11,7 +11,7 @@ categories = ["asynchronous", "network-programming"]
 
 [lib]
 name="penprox"
-path = "src/penprox/_src/lib.rs"
+path = "src/penprox/crate/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

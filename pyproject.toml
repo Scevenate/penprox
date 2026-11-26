@@ -8,7 +8,6 @@ description = "Python proxy toolbox"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Unlicense"
-license-files = ["LICENSES/*"]
 classifiers = [
     "Environment :: Console",
     "Programming Language :: Rust",
@@ -36,7 +35,7 @@ include-package-data = false
 where = ["src"]
 
 [[tool.setuptools-rust.ext-modules]]
-target = "penprox._src.penprox"
+target = "penprox.crate.penprox"
 binding = "PyO3"
 
 [tool.cibuildwheel]

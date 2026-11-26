@@ -1,12 +1,8 @@
-# Script of a basic SOCKS5 server.
-# A second hop is introduced for fun.
-
 from ipaddress import IPv4Address
 from sys import stderr
 from threading import Thread
 
 from penprox import *
-from penprox.socks5 import *
 
 set_logger(stderr, LogLevel.DEBUG)
 
