@@ -5,7 +5,7 @@
 > [!NOTE]
 > This project is still in beta phase. I haven't wrote a comprehensive documentation for it yet but the core interface is quite stable.
 
-Penprox is a library for prototyping network applications. You draw a graph in python, and it compiles to a multithreaded native pipeline so it's expected to be quite fast.
+Penprox is a library for prototyping network applications. You draw a graph in python, and it compiles to a multithreaded tokio native pipeline so it's expected to be quite fast.
 
 ## Example
 
